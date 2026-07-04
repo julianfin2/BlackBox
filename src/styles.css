@@ -25,3 +25,4 @@
 .panel-title>button:disabled{opacity:.65;cursor:wait}
 .recent>.panel-title{padding-bottom:16px}
 .incident{font-size:16px}
+.modal fieldset{display:block;margin:0;padding:22px 0 10px}.modal fieldset>legend{float:left;width:100%;margin:0 0 13px;padding:0;color:#dce4ef;font-size:14px;font-weight:600;line-height:20px}.modal fieldset>.symptoms{clear:both;margin-top:0}
