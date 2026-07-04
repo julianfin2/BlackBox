@@ -24,7 +24,12 @@ const nav = [{id:"dashboard",label:"概览",icon:LayoutDashboard},{id:"incidents
 const capabilityCategories=["运行环境","基础采集","高级诊断","本地分析"];
 const symptoms:{value:Symptom,label:string,icon:typeof Activity}[]=[{value:"system_slow",label:"系统卡顿",icon:Gauge},{value:"system_freeze",label:"系统无响应",icon:Pause},{value:"app_hang",label:"程序无响应",icon:Activity},{value:"network_slow",label:"网速慢",icon:Network},{value:"network_offline",label:"网络断开",icon:Zap},{value:"display_issue",label:"显示异常",icon:TriangleAlert},{value:"auto_restart",label:"自动重启",icon:RefreshCw},{value:"blue_screen",label:"蓝屏",icon:TriangleAlert},{value:"other",label:"其他",icon:FileText}];
 const filtered=computed(()=>incidents.value.filter(x=>(x.symptom_label+(x.likely_cause||"")).includes(query.value)));
-const fmt=(v:number)=>v<1048576?`${(v/1024).toFixed(1)} KB`:`${(v/1073741824).toFixed(2)} GB`;
+const fmt=(v:number)=>{
+  if(v<1024)return `${Math.round(v)} B`;
+  if(v<1048576)return `${(v/1024).toFixed(1)} KB`;
+  if(v<1073741824)return `${(v/1048576).toFixed(v<10485760?2:1)} MB`;
+  return `${(v/1073741824).toFixed(2)} GB`;
+};
 const date=(v:string)=>new Intl.DateTimeFormat("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}).format(new Date(v));
 const status=(v:string)=>({capturing:"采集事故后窗口",freezing:"冻结证据",extracting:"提取事实",ready_for_analysis:"待分析",analyzing:"分析中",completed:"已完成",failed:"处理失败"} as Record<string,string>)[v]||v;
 const sourceLabel=(v:string)=>({manual:"主界面",shortcut:"全局快捷键",tray:"系统托盘",recovery:"异常会话恢复",automatic:"自动触发"} as Record<string,string>)[v]||v;
