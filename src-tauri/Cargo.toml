@@ -2,7 +2,7 @@
 name = "blackbox"
 version = "0.1.0"
 description = "Local-first Windows system incident recorder and diagnostic tool"
-authors = ["System BlackBox contributors"]
+authors = ["Julian F."]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
