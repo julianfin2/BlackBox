@@ -507,7 +507,7 @@ pub(crate) fn start_logman(root: &Path, interval: u64, limit_mb: u64) -> String 
         let _ = fs::create_dir_all(&dir);
         let output = dir.join("performance");
         let _ = Command::new("logman")
-            .args(["stop", "SystemBlackBox", "-ets"])
+            .args(["stop", "SystemBlackBox"])
             .output();
         let _ = Command::new("logman")
             .args(["delete", "SystemBlackBox"])
@@ -538,7 +538,7 @@ pub(crate) fn start_logman(root: &Path, interval: u64, limit_mb: u64) -> String 
         match result {
             Ok(value) if value.status.success() => {
                 match Command::new("logman")
-                    .args(["start", "SystemBlackBox", "-ets"])
+                    .args(["start", "SystemBlackBox"])
                     .output()
                 {
                     Ok(value) if value.status.success() => "运行中（logman 循环 BLG）".into(),
@@ -567,7 +567,7 @@ pub(crate) fn stop_logman() {
     #[cfg(target_os = "windows")]
     {
         let _ = Command::new("logman")
-            .args(["stop", "SystemBlackBox", "-ets"])
+            .args(["stop", "SystemBlackBox"])
             .output();
     }
 }
