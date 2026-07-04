@@ -503,6 +503,21 @@ pub(crate) fn export_event_logs(
 pub(crate) fn start_logman(root: &Path, interval: u64, limit_mb: u64) -> String {
     #[cfg(target_os = "windows")]
     {
+        fn output_details(output: &std::process::Output) -> String {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let details = [stderr.trim(), stdout.trim()]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("；");
+            if details.is_empty() {
+                format!("退出状态 {}", output.status)
+            } else {
+                details
+            }
+        }
+
         let dir = root.join("rolling");
         let _ = fs::create_dir_all(&dir);
         let output = dir.join("performance");
@@ -537,22 +552,28 @@ pub(crate) fn start_logman(root: &Path, interval: u64, limit_mb: u64) -> String 
             .output();
         match result {
             Ok(value) if value.status.success() => {
-                match Command::new("logman")
-                    .args(["start", "SystemBlackBox"])
-                    .output()
-                {
-                    Ok(value) if value.status.success() => "运行中（logman 循环 BLG）".into(),
-                    Ok(value) => format!(
-                        "降级：logman 启动失败（{}）",
-                        String::from_utf8_lossy(&value.stderr).trim()
-                    ),
-                    Err(error) => format!("降级：无法启动 logman（{error}）"),
+                let mut last_error = String::new();
+                for attempt in 0..4 {
+                    if attempt > 0 {
+                        let _ = Command::new("logman")
+                            .args(["stop", "SystemBlackBox"])
+                            .output();
+                    }
+                    thread::sleep(Duration::from_millis(250 * (attempt + 1)));
+                    match Command::new("logman")
+                        .args(["start", "SystemBlackBox"])
+                        .output()
+                    {
+                        Ok(value) if value.status.success() => {
+                            return "运行中（logman 循环 BLG）".into();
+                        }
+                        Ok(value) => last_error = output_details(&value),
+                        Err(error) => last_error = error.to_string(),
+                    }
                 }
+                format!("降级：logman 启动失败（{last_error}）")
             }
-            Ok(value) => format!(
-                "降级：logman 配置失败（{}）",
-                String::from_utf8_lossy(&value.stderr).trim()
-            ),
+            Ok(value) => format!("降级：logman 配置失败（{}）", output_details(&value)),
             Err(error) => format!("降级：logman 不可用（{error}）"),
         }
     }
