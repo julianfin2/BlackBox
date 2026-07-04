@@ -7,6 +7,7 @@ mod storage;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -171,7 +172,37 @@ struct AppState {
     logman_status: Mutex<String>,
     recovery: Mutex<Option<RecoveryCandidate>>,
     io_lock: Arc<Mutex<()>>,
+    incident_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     shortcut_status: Mutex<String>,
+}
+
+type IncidentCancellations = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+
+#[derive(Clone)]
+struct IncidentRuntime {
+    io_lock: Arc<Mutex<()>>,
+    monitoring: Arc<AtomicBool>,
+    cancellations: IncidentCancellations,
+}
+
+fn cancel_incident(cancellations: &IncidentCancellations, id: &str) {
+    if let Some(cancellation) = cancellations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(id)
+    {
+        cancellation.store(true, Ordering::Release);
+    }
+}
+
+fn cancel_all_incidents(cancellations: &IncidentCancellations) {
+    for cancellation in cancellations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+    {
+        cancellation.store(true, Ordering::Release);
+    }
 }
 
 fn read_json<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, String> {
@@ -485,8 +516,11 @@ fn create_incident(
         draft,
         trigger_time,
         "manual",
-        s.io_lock.clone(),
-        s.monitoring.clone(),
+        IncidentRuntime {
+            io_lock: s.io_lock.clone(),
+            monitoring: s.monitoring.clone(),
+            cancellations: s.incident_cancellations.clone(),
+        },
     )?;
     build_detail(&s, incident)
 }
@@ -497,14 +531,16 @@ fn create_incident_internal(
     draft: IncidentDraft,
     trigger_override: Option<String>,
     trigger_source: &str,
-    io_lock: Arc<Mutex<()>>,
-    monitoring: Arc<AtomicBool>,
+    runtime: IncidentRuntime,
 ) -> Result<Incident, String> {
     validate_incident_draft(&draft)?;
     if !["manual", "shortcut", "tray", "recovery", "automatic"].contains(&trigger_source) {
         return Err("事故触发来源无效".into());
     }
-    let _guard = io_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = runtime
+        .io_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let now = Utc::now().to_rfc3339();
     let id = Uuid::new_v4().simple().to_string()[..8].to_string();
     let incident = Incident {
@@ -561,14 +597,38 @@ fn create_incident_internal(
     storage::audit(root, "incident.created", Some(&id), Some(&draft.symptom))?;
     let worker_root = root.to_path_buf();
     let worker_id = id.clone();
-    let worker_io_lock = io_lock.clone();
-    let worker_monitoring = monitoring.clone();
-    thread::Builder::new()
+    let worker_io_lock = runtime.io_lock.clone();
+    let worker_monitoring = runtime.monitoring.clone();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    runtime
+        .cancellations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(id.clone(), cancellation.clone());
+    let worker_cancellations = runtime.cancellations.clone();
+    if let Err(error) = thread::Builder::new()
         .name(format!("incident-{worker_id}"))
         .spawn(move || {
-            finalize_incident(&worker_root, &worker_id, worker_io_lock, worker_monitoring)
+            finalize_incident(
+                &worker_root,
+                &worker_id,
+                worker_io_lock,
+                worker_monitoring,
+                cancellation,
+            );
+            worker_cancellations
+                .lock()
+                .unwrap_or_else(|value| value.into_inner())
+                .remove(&worker_id);
         })
-        .map_err(|error| error.to_string())?;
+    {
+        runtime
+            .cancellations
+            .lock()
+            .unwrap_or_else(|value| value.into_inner())
+            .remove(&id);
+        return Err(error.to_string());
+    }
     Ok(incident)
 }
 
@@ -698,6 +758,7 @@ fn write_report_markdown(path: &Path, incident: &Incident, report: &Report) -> R
 }
 #[tauri::command]
 fn delete_incident(s: State<AppState>, id: String) -> Result<(), String> {
+    cancel_incident(&s.incident_cancellations, &id);
     let _guard = s.io_lock.lock().unwrap_or_else(|error| error.into_inner());
     let p = incidents_dir(&s).join(&id);
     if p.exists() {
@@ -736,6 +797,7 @@ fn set_incident_pinned(s: State<AppState>, id: String, pinned: bool) -> Result<D
 }
 #[tauri::command]
 fn delete_all_incidents(s: State<AppState>) -> Result<(), String> {
+    cancel_all_incidents(&s.incident_cancellations);
     let _guard = s.io_lock.lock().unwrap_or_else(|error| error.into_inner());
     let p = incidents_dir(&s);
     if p.exists() {
@@ -748,11 +810,12 @@ fn delete_all_incidents(s: State<AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn delete_all_data(s: State<AppState>) -> Result<Dashboard, String> {
+    cancel_all_incidents(&s.incident_cancellations);
     let was_enabled = s.monitoring.swap(false, Ordering::Relaxed);
-    collector::stop_logman();
     let deletion_result = {
         let _guard = s.io_lock.lock().unwrap_or_else(|error| error.into_inner());
         (|| -> Result<(), String> {
+            collector::stop_logman();
             for path in [incidents_dir(&s), s.root.join("rolling")] {
                 if path.exists() {
                     fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
@@ -822,8 +885,11 @@ fn resolve_recovery(s: State<AppState>, create: bool) -> Result<Option<Detail>, 
         },
         trigger_time,
         "recovery",
-        s.io_lock.clone(),
-        s.monitoring.clone(),
+        IncidentRuntime {
+            io_lock: s.io_lock.clone(),
+            monitoring: s.monitoring.clone(),
+            cancellations: s.incident_cancellations.clone(),
+        },
     ) {
         Ok(incident) => incident,
         Err(error) => {
@@ -840,17 +906,42 @@ fn resolve_recovery(s: State<AppState>, create: bool) -> Result<Option<Detail>, 
     build_detail(&s, incident).map(Some)
 }
 
-fn finalize_incident(root: &Path, id: &str, io_lock: Arc<Mutex<()>>, monitoring: Arc<AtomicBool>) {
+fn incident_cancelled(cancellation: &AtomicBool) -> bool {
+    cancellation.load(Ordering::Acquire)
+}
+
+fn wait_for_incident_window(target_end_ms: i64, cancellation: &AtomicBool) -> bool {
+    loop {
+        if incident_cancelled(cancellation) {
+            return false;
+        }
+        let remaining_ms = target_end_ms.saturating_sub(Utc::now().timestamp_millis());
+        if remaining_ms <= 0 {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(remaining_ms.min(100) as u64));
+    }
+}
+
+fn finalize_incident(
+    root: &Path,
+    id: &str,
+    io_lock: Arc<Mutex<()>>,
+    monitoring: Arc<AtomicBool>,
+    cancellation: Arc<AtomicBool>,
+) {
     let dir = root.join("incidents").join(id);
     let result = (|| -> Result<(), String> {
         let mut incident: Incident = read_json(&dir.join("incident.json"))?;
         let trigger = collector::parse_time(&incident.trigger_time)?.timestamp_millis();
         let target_end = trigger + incident.post_window_seconds as i64 * 1000;
-        let remaining_ms = target_end.saturating_sub(Utc::now().timestamp_millis());
-        if remaining_ms > 0 {
-            thread::sleep(Duration::from_millis(remaining_ms as u64));
+        if !wait_for_incident_window(target_end, &cancellation) {
+            return Ok(());
         }
         let _guard = io_lock.lock().unwrap_or_else(|error| error.into_inner());
+        if incident_cancelled(&cancellation) || !dir.is_dir() {
+            return Ok(());
+        }
         incident.status = "freezing".into();
         write_json(&dir.join("incident.json"), &incident)?;
 
@@ -858,6 +949,9 @@ fn finalize_incident(root: &Path, id: &str, io_lock: Arc<Mutex<()>>, monitoring:
         let end = trigger + incident.post_window_seconds as i64 * 1000;
         let evidence = dir.join("evidence");
         let samples = collector::freeze_window(root, &evidence, start, end)?;
+        if incident_cancelled(&cancellation) {
+            return Ok(());
+        }
         let settings: Settings = read_json(&root.join("settings.json")).unwrap_or_default();
         let blg_status = collector::freeze_logman(
             root,
@@ -865,8 +959,14 @@ fn finalize_incident(root: &Path, id: &str, io_lock: Arc<Mutex<()>>, monitoring:
             &settings,
             monitoring.load(Ordering::Relaxed),
         );
+        if incident_cancelled(&cancellation) {
+            return Ok(());
+        }
         let _ = fs::write(evidence.join("performance-status.txt"), blg_status);
         collector::export_event_logs(&evidence, start, end);
+        if incident_cancelled(&cancellation) {
+            return Ok(());
+        }
 
         incident.status = "extracting".into();
         write_json(&dir.join("incident.json"), &incident)?;
@@ -875,6 +975,9 @@ fn finalize_incident(root: &Path, id: &str, io_lock: Arc<Mutex<()>>, monitoring:
             fs::read_to_string(evidence.join("application.xml")).unwrap_or_default();
         let observations =
             analysis::extract(&samples, trigger, &system_events, &application_events);
+        if incident_cancelled(&cancellation) {
+            return Ok(());
+        }
         write_json(&dir.join("extracted/facts.json"), &observations)?;
         storage::replace_observations(root, id, &observations)?;
         incident.status = "ready_for_analysis".into();
@@ -884,6 +987,9 @@ fn finalize_incident(root: &Path, id: &str, io_lock: Arc<Mutex<()>>, monitoring:
         enforce_incident_retention(root, &settings)
     })();
     if let Err(error) = result {
+        if incident_cancelled(&cancellation) || !dir.is_dir() {
+            return;
+        }
         if let Ok(mut incident) = read_json::<Incident>(&dir.join("incident.json")) {
             incident.status = "failed".into();
             let _ = write_json(&dir.join("incident.json"), &incident);
@@ -910,6 +1016,12 @@ fn enforce_incident_retention(root: &Path, settings: &Settings) -> Result<(), St
             Ok(value) => value,
             Err(_) => continue,
         };
+        if matches!(
+            incident.status.as_str(),
+            "capturing" | "freezing" | "extracting" | "analyzing"
+        ) {
+            continue;
+        }
         let created = collector::parse_time(&incident.created_at)?;
         if settings.retention_days > 0
             && now.signed_duration_since(created).num_days() >= settings.retention_days as i64
@@ -963,8 +1075,11 @@ fn quick_incident(app: &tauri::AppHandle, symptom: &str, severity: &str, trigger
         draft,
         None,
         trigger_source,
-        state.io_lock.clone(),
-        state.monitoring.clone(),
+        IncidentRuntime {
+            io_lock: state.io_lock.clone(),
+            monitoring: state.monitoring.clone(),
+            cancellations: state.incident_cancellations.clone(),
+        },
     );
 }
 
@@ -1003,6 +1118,7 @@ pub fn run() {
             let monitoring = Arc::new(AtomicBool::new(true));
             let latest = Arc::new(Mutex::new(collector::Sample::default()));
             let io_lock = Arc::new(Mutex::new(()));
+            let incident_cancellations = Arc::new(Mutex::new(HashMap::new()));
             let previous_session: Option<serde_json::Value> =
                 read_json(&root.join("session.lock")).ok();
             let recovery = previous_session.map(|value| RecoveryCandidate {
@@ -1044,6 +1160,7 @@ pub fn run() {
                 logman_status: Mutex::new(logman_status),
                 recovery: Mutex::new(recovery),
                 io_lock,
+                incident_cancellations,
                 shortcut_status: Mutex::new("正在注册".into()),
             });
 
@@ -1204,6 +1321,57 @@ mod tests {
         enforce_incident_retention(&root.0, &Settings::default()).unwrap();
         assert!(!root.0.join("incidents/expired").exists());
         assert!(root.0.join("incidents/pinned").exists());
+    }
+
+    #[test]
+    fn cancelled_capture_does_not_recreate_deleted_incident() {
+        let root = TestDirectory::new();
+        add_incident(&root.0, "pending", 0, false);
+        let manifest = root.0.join("incidents/pending/incident.json");
+        let mut incident: Incident = read_json(&manifest).unwrap();
+        incident.status = "capturing".into();
+        incident.trigger_time = Utc::now().to_rfc3339();
+        incident.post_window_seconds = 10;
+        write_json(&manifest, &incident).unwrap();
+
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let io_lock = Arc::new(Mutex::new(()));
+        let worker_root = root.0.clone();
+        let worker_cancellation = cancellation.clone();
+        let worker_lock = io_lock.clone();
+        let handle = thread::spawn(move || {
+            finalize_incident(
+                &worker_root,
+                "pending",
+                worker_lock,
+                Arc::new(AtomicBool::new(false)),
+                worker_cancellation,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        cancellation.store(true, Ordering::Release);
+        {
+            let _guard = io_lock.lock().unwrap();
+            fs::remove_dir_all(root.0.join("incidents/pending")).unwrap();
+            storage::delete_incident(&root.0, "pending").unwrap();
+        }
+        handle.join().unwrap();
+
+        assert!(!root.0.join("incidents/pending").exists());
+    }
+
+    #[test]
+    fn retention_does_not_delete_active_capture() {
+        let root = TestDirectory::new();
+        add_incident(&root.0, "pending", 31, false);
+        let manifest = root.0.join("incidents/pending/incident.json");
+        let mut incident: Incident = read_json(&manifest).unwrap();
+        incident.status = "capturing".into();
+        write_json(&manifest, &incident).unwrap();
+
+        enforce_incident_retention(&root.0, &Settings::default()).unwrap();
+        assert!(root.0.join("incidents/pending").exists());
     }
 
     #[test]
