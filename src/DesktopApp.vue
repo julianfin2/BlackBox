@@ -7,6 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { AppSettings, CapabilityReport, Dashboard, DiagnosticCapability, Incident, IncidentDetail, IncidentDraft, Observation, RecoveryCandidate, Symptom } from "./types";
 import { useAppStore } from "./stores/app";
+import ConfirmDialog from "./components/ConfirmDialog.vue";
 import DesktopSelect from "./components/DesktopSelect.vue";
 import "./styles.css";
 
@@ -14,6 +15,7 @@ type Page = "dashboard"|"incidents"|"capabilities"|"privacy"|"settings";
 const route = useRoute(), router = useRouter();
 const page = computed<Page>({get:()=>{const value=route.params.section;return typeof value==="string"&&["dashboard","incidents","capabilities","privacy","settings"].includes(value)?value as Page:"dashboard"},set:value=>{void router.push(`/${value}`);if(value==="capabilities"&&!capabilityReport.value)void loadCapabilities()}});
 const modal = ref(false), pendingTriggerTime = ref<string|null>(null), busy = ref(false), query = ref(""), tab = ref("summary"), errorMessage = ref(""), saved = ref(false);
+const confirmation = ref<{type:"incident"|"all";id?:string}|null>(null), confirmationBusy = ref(false);
 const appStore = useAppStore();
 const { dashboard, incidents, settings } = storeToRefs(appStore);
 const selected = ref<IncidentDetail|null>(null);
@@ -45,8 +47,9 @@ async function create(){busy.value=true;try{selected.value=await call("create_in
 async function open(id:string){try{selected.value=await call("get_incident",{id});page.value="incidents";tab.value="summary";timelineZoom.value=720;focusedEvidence.value=null}catch(error){errorMessage.value=message(error)}}
 async function analyze(){if(!selected.value)return;busy.value=true;try{selected.value=await call("analyze_incident",{id:selected.value.incident.id});await refresh()}catch(error){errorMessage.value=message(error)}finally{busy.value=false}}
 async function togglePin(){if(!selected.value)return;try{selected.value=await call("set_incident_pinned",{id:selected.value.incident.id,pinned:!selected.value.pinned})}catch(error){errorMessage.value=message(error)}}
-async function remove(id:string){if(confirm("永久删除这条事故及其全部证据？")){await call("delete_incident",{id});selected.value=null;await refresh()}}
-async function removeAll(){if(confirm("永久删除所有循环日志、事故包和诊断索引？设置会保留，此操作无法撤销。")){try{dashboard.value=await call("delete_all_data");selected.value=null;await refresh()}catch(error){errorMessage.value=message(error)}}}
+function remove(id:string){confirmation.value={type:"incident",id}}
+function removeAll(){confirmation.value={type:"all"}}
+async function confirmRemoval(){if(!confirmation.value)return;confirmationBusy.value=true;try{if(confirmation.value.type==="incident"){await call("delete_incident",{id:confirmation.value.id});selected.value=null}else{dashboard.value=await call("delete_all_data");selected.value=null}confirmation.value=null;await refresh()}catch(error){errorMessage.value=message(error)}finally{confirmationBusy.value=false}}
 async function save(){try{settings.value=await call("save_settings",{settings:settings.value});saved.value=true;setTimeout(()=>saved.value=false,1800)}catch(error){errorMessage.value=message(error)}}
 async function resolveRecovery(create:boolean){try{const detail=await call<IncidentDetail|null>("resolve_recovery",{create});recovery.value=null;if(detail){selected.value=detail;page.value="incidents"}}catch(error){errorMessage.value=message(error)}}
 async function reveal(path:string){try{await revealItemInDir(path)}catch(error){errorMessage.value=message(error)}}
@@ -106,6 +109,8 @@ let timer=0;onMounted(async()=>{try{[settings.value,recovery.value]=await Promis
 </div>
 
 <div v-if="errorMessage" class="toast"><TriangleAlert/><span>{{errorMessage}}</span><button class="icon" @click="errorMessage=''"><X/></button></div>
+
+<ConfirmDialog id="delete-confirmation" :open="!!confirmation" :busy="confirmationBusy" :title="confirmation?.type==='all'?'删除所有本地数据？':'删除这条事故记录？'" :description="confirmation?.type==='all'?'循环日志、全部事故包和诊断索引将被永久删除；应用设置会保留。此操作无法撤销。':'该事故及其全部证据、分析报告和原始文件将被永久删除。此操作无法撤销。'" :confirm-label="confirmation?.type==='all'?'删除全部数据':'永久删除'" @cancel="confirmation=null" @confirm="confirmRemoval"/>
 
 <div v-if="modal" class="backdrop" @click.self="modal=false"><form class="modal" @submit.prevent="create"><header><div><Zap/><span><h2>标记刚才的问题</h2><p>触发时刻已记录，补充信息即可保存现场。</p></span></div><button type="button" class="icon" @click="modal=false"><X/></button></header><fieldset><legend>发生了什么？</legend><div class="symptoms"><button v-for="s in symptoms" type="button" :class="{active:draft.symptom===s.value}" @click="draft.symptom=s.value"><component :is="s.icon"/>{{s.label}}</button></div></fieldset><div class="form-row"><label>严重程度<DesktopSelect v-model="draft.severity" aria-label="严重程度" :options="[{value:'low',label:'轻微'},{value:'medium',label:'中等'},{value:'high',label:'严重'},{value:'critical',label:'系统不可用'}]"/></label><label>持续多久<DesktopSelect v-model="draft.duration_seconds" aria-label="持续多久" :options="[{value:5,label:'少于 10 秒'},{value:30,label:'约 30 秒'},{value:120,label:'1–2 分钟'}]"/></label></div><label>补充描述（可选）<textarea v-model="draft.description" maxlength="1000" placeholder="例如：切换窗口时整个系统冻结…"></textarea></label><footer><span><ShieldCheck/>数据仅保存在本机</span><button class="primary" :disabled="busy"><Activity/>保存事故现场</button></footer></form></div>
 </template>
