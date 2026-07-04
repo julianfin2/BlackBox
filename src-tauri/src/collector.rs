@@ -546,6 +546,7 @@ pub(crate) fn start_logman(root: &Path, interval: u64, limit_mb: u64) -> String 
                 "bincirc",
                 "-max",
                 &limit,
+                "-ow",
                 "-o",
             ])
             .arg(output)
