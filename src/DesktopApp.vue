@@ -2,24 +2,26 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { storeToRefs } from "pinia";
 import { useRoute, useRouter } from "vue-router";
-import { Activity, Archive, Bot, Check, ChevronRight, CircleGauge, Clock3, Cpu, Database, FileText, Filter, FolderOpen, Gauge, HardDrive, LayoutDashboard, MemoryStick, Network, Pause, Pin, Play, Plus, RefreshCw, Search, Settings, ShieldCheck, Sparkles, Trash2, TriangleAlert, X, Zap, ZoomIn } from "@lucide/vue";
+import { Activity, Archive, Bot, Check, ChevronRight, CircleCheck, CircleGauge, CircleX, Clock3, Cpu, Database, FileText, Filter, FolderOpen, Gauge, HardDrive, LayoutDashboard, MemoryStick, Network, Pause, Pin, Play, Plus, RefreshCw, Search, Settings, ShieldCheck, Sparkles, Terminal, Trash2, TriangleAlert, Wrench, X, Zap, ZoomIn } from "@lucide/vue";
 import { invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { AppSettings, Dashboard, Incident, IncidentDetail, IncidentDraft, Observation, RecoveryCandidate, Symptom } from "./types";
+import type { AppSettings, CapabilityReport, Dashboard, DiagnosticCapability, Incident, IncidentDetail, IncidentDraft, Observation, RecoveryCandidate, Symptom } from "./types";
 import { useAppStore } from "./stores/app";
 import "./styles.css";
 
-type Page = "dashboard"|"incidents"|"privacy"|"settings";
+type Page = "dashboard"|"incidents"|"capabilities"|"privacy"|"settings";
 const route = useRoute(), router = useRouter();
-const page = computed<Page>({get:()=>{const value=route.params.section;return typeof value==="string"&&["dashboard","incidents","privacy","settings"].includes(value)?value as Page:"dashboard"},set:value=>{void router.push(`/${value}`)}});
+const page = computed<Page>({get:()=>{const value=route.params.section;return typeof value==="string"&&["dashboard","incidents","capabilities","privacy","settings"].includes(value)?value as Page:"dashboard"},set:value=>{void router.push(`/${value}`);if(value==="capabilities"&&!capabilityReport.value)void loadCapabilities()}});
 const modal = ref(false), pendingTriggerTime = ref<string|null>(null), busy = ref(false), query = ref(""), tab = ref("summary"), errorMessage = ref(""), saved = ref(false);
 const appStore = useAppStore();
 const { dashboard, incidents, settings } = storeToRefs(appStore);
 const selected = ref<IncidentDetail|null>(null);
 const recovery = ref<RecoveryCandidate|null>(null);
+const capabilityReport = ref<CapabilityReport|null>(null), capabilityLoading = ref(false);
 const timelineZoom = ref<720 | 300 | 120>(720), visibleTracks = ref(["CPU","内存","磁盘","网络","事件"]), focusedEvidence = ref<Observation|null>(null);
 const draft = ref<IncidentDraft>({symptom:"system_freeze",severity:"high",duration_seconds:10,still_happening:false,description:""});
-const nav = [{id:"dashboard",label:"概览",icon:LayoutDashboard},{id:"incidents",label:"事故记录",icon:Archive},{id:"privacy",label:"隐私与数据",icon:ShieldCheck},{id:"settings",label:"设置",icon:Settings}] as const;
+const nav = [{id:"dashboard",label:"概览",icon:LayoutDashboard},{id:"incidents",label:"事故记录",icon:Archive},{id:"capabilities",label:"诊断能力",icon:Wrench},{id:"privacy",label:"隐私与数据",icon:ShieldCheck},{id:"settings",label:"设置",icon:Settings}] as const;
+const capabilityCategories=["运行环境","基础采集","高级诊断","本地分析"];
 const symptoms:{value:Symptom,label:string,icon:typeof Activity}[]=[{value:"system_slow",label:"系统卡顿",icon:Gauge},{value:"system_freeze",label:"系统无响应",icon:Pause},{value:"app_hang",label:"程序无响应",icon:Activity},{value:"network_slow",label:"网速慢",icon:Network},{value:"network_offline",label:"网络断开",icon:Zap},{value:"display_issue",label:"显示异常",icon:TriangleAlert},{value:"auto_restart",label:"自动重启",icon:RefreshCw},{value:"blue_screen",label:"蓝屏",icon:TriangleAlert},{value:"other",label:"其他",icon:FileText}];
 const filtered=computed(()=>incidents.value.filter(x=>(x.symptom_label+(x.likely_cause||"")).includes(query.value)));
 const fmt=(v:number)=>v<1048576?`${(v/1024).toFixed(1)} KB`:`${(v/1073741824).toFixed(2)} GB`;
@@ -29,6 +31,7 @@ const sourceLabel=(v:string)=>({manual:"主界面",shortcut:"全局快捷键",tr
 const call=<T,>(cmd:string,args?:Record<string,unknown>)=>invoke<T>(cmd,args);
 function message(value:unknown){return typeof value==="string"?value:value instanceof Error?value.message:"操作失败"}
 async function refresh(){try{[dashboard.value,incidents.value]=await Promise.all([call<Dashboard>("get_dashboard"),call<Incident[]>("list_incidents")]);if(selected.value)selected.value=await call("get_incident",{id:selected.value.incident.id})}catch(error){errorMessage.value=message(error)}}
+async function loadCapabilities(){capabilityLoading.value=true;try{capabilityReport.value=await call<CapabilityReport>("get_diagnostic_capabilities")}catch(error){errorMessage.value=message(error)}finally{capabilityLoading.value=false}}
 async function toggle(){busy.value=true;try{dashboard.value=await call("set_monitoring",{enabled:!dashboard.value.monitoring})}catch(error){errorMessage.value=message(error)}finally{busy.value=false}}
 function openIncidentModal(){pendingTriggerTime.value=new Date().toISOString();modal.value=true}
 async function create(){busy.value=true;try{selected.value=await call("create_incident",{draft:draft.value,triggerTime:pendingTriggerTime.value});modal.value=false;pendingTriggerTime.value=null;page.value="incidents";await refresh()}catch(error){errorMessage.value=message(error)}finally{busy.value=false}}
@@ -43,7 +46,9 @@ async function reveal(path:string){try{await revealItemInDir(path)}catch(error){
 function toggleTrack(label:string){visibleTracks.value=visibleTracks.value.includes(label)?visibleTracks.value.filter(value=>value!==label):[...visibleTracks.value,label]}
 function timelinePosition(offsetMs:number){const windows={720:[-600,120],300:[-240,60],120:[-90,30]} as const;const [start,end]=windows[timelineZoom.value];const seconds=offsetMs/1000;return seconds<start||seconds>end?-1:(seconds-start)/(end-start)*100}
 function focusEvidence(id:string){focusedEvidence.value=selected.value?.observations.find(item=>item.id===id)||null}
-let timer=0;onMounted(async()=>{try{[settings.value,recovery.value]=await Promise.all([call<AppSettings>("get_settings"),call<RecoveryCandidate|null>("get_recovery_candidate")]);await refresh();timer=setInterval(refresh,4000)}catch(error){errorMessage.value=message(error)}});onUnmounted(()=>clearInterval(timer));
+const capabilityStatus=(value:DiagnosticCapability["status"])=>({available:"可用",degraded:"运行异常",unavailable:"不可用",permission_required:"权限不足",not_installed:"未安装",misconfigured:"配置错误",disabled:"未启用"} as const)[value];
+const capabilityIcon=(item:DiagnosticCapability)=>item.id==="ollama"?Bot:item.id==="elevation"?ShieldCheck:["pdh","memory_api","ip_helper"].includes(item.id)?Activity:Terminal;
+let timer=0;onMounted(async()=>{try{[settings.value,recovery.value]=await Promise.all([call<AppSettings>("get_settings"),call<RecoveryCandidate|null>("get_recovery_candidate")]);await refresh();if(page.value==="capabilities")await loadCapabilities();timer=setInterval(refresh,4000)}catch(error){errorMessage.value=message(error)}});onUnmounted(()=>clearInterval(timer));
 </script>
 
 <template>
@@ -52,7 +57,7 @@ let timer=0;onMounted(async()=>{try{[settings.value,recovery.value]=await Promis
     <nav><button v-for="n in nav" :class="{active:page===n.id}" @click="page=n.id;selected=null"><component :is="n.icon"/>{{n.label}}</button></nav>
     <footer><p><i :class="{live:dashboard.monitoring}"></i>{{dashboard.monitoring?"监控正在运行":"监控已暂停"}}</p><small>Ctrl + Shift + F12 快速标记</small><small>数据仅保存在此设备</small></footer>
   </aside>
-  <main><header><div><h1>{{selected?"事故详情":nav.find(n=>n.id===page)?.label}}</h1><p>{{selected?`${selected.incident.symptom_label} · ${date(selected.incident.created_at)}`:"持续记录系统状态，在故障消失前留下证据"}}</p></div><button class="icon" @click="refresh"><RefreshCw/></button></header>
+  <main><header><div><h1>{{selected?"事故详情":nav.find(n=>n.id===page)?.label}}</h1><p>{{selected?`${selected.incident.symptom_label} · ${date(selected.incident.created_at)}`:page==="capabilities"?"验证诊断组件、权限与本地分析服务":"持续记录系统状态，在故障消失前留下证据"}}</p></div><button class="icon" :disabled="capabilityLoading" @click="page==='capabilities'?loadCapabilities():refresh()"><RefreshCw :class="{spinning:capabilityLoading}"/></button></header>
 
     <section v-if="page==='dashboard'" class="page">
       <div v-if="recovery" class="recovery"><TriangleAlert/><span><b>检测到上次运行可能异常中断</b><small>最后有效采样：{{recovery.last_sample_at?date(recovery.last_sample_at):"未知"}}</small></span><button class="secondary" @click="resolveRecovery(false)">忽略</button><button class="primary" @click="resolveRecovery(true)">创建事故记录</button></div>
@@ -78,6 +83,14 @@ let timer=0;onMounted(async()=>{try{[settings.value,recovery.value]=await Promis
       <div v-else-if="tab==='evidence'" class="panel evidence"><h3>结构化观察结果</h3><div v-for="o in selected.observations"><Activity/><span><b>{{o.title}}</b><p>{{o.description}}</p><code>{{o.id}} · {{o.source}} · {{o.offset_ms/1000}}s</code></span><em :class="o.severity">{{o.severity}}</em></div><p v-if="!selected.observations.length" class="empty">未提取到异常</p></div>
       <div v-else-if="tab==='ai'" class="panel ai"><Bot/><h3>本地 AI 诊断</h3><p>AI 只能解释已有证据，不能修改数据或执行修复。</p><h2>{{selected.report?.summary||"尚未生成报告"}}</h2></div>
       <div v-else class="panel raw"><h3>事故包文件</h3><p><ShieldCheck/>这些文件不会自动上传。</p><div v-for="f in selected.raw_files"><FileText/><span><b>{{f.name}}</b><small>{{f.kind}}</small></span><em>{{fmt(f.size_bytes)}}</em></div><code>{{selected.data_path}}</code><button class="secondary reveal" @click="reveal(selected.data_path)"><FolderOpen/>在文件资源管理器中定位</button></div>
+    </section>
+
+    <section v-else-if="page==='capabilities'" class="page capabilities-page">
+      <div v-if="capabilityReport" class="capability-overview panel"><div><span :class="['capability-health',{warning:capabilityReport.attention}]"><CircleCheck v-if="!capabilityReport.attention"/><TriangleAlert v-else/></span><div><h2>{{capabilityReport.attention?`${capabilityReport.attention} 项基础能力需要处理`:"基础诊断能力正常"}}</h2><p>{{capabilityReport.available}} 项能力可用 · 当前进程{{capabilityReport.is_elevated?"已提升权限":"未提升权限"}} · 检测于 {{date(capabilityReport.checked_at)}}</p></div></div><button class="secondary" :disabled="capabilityLoading" @click="loadCapabilities"><RefreshCw :class="{spinning:capabilityLoading}"/>重新检测</button></div>
+      <div v-else class="panel capability-loading"><RefreshCw class="spinning"/><span><b>正在检测诊断能力</b><small>只检查本机组件、权限与已配置的本地服务。</small></span></div>
+      <article v-for="category in capabilityCategories" v-if="capabilityReport" class="panel capability-group"><header><div><h3>{{category}}</h3><p>{{category==="基础采集"?"当前版本直接依赖的系统采集能力":category==="高级诊断"?"后续阶段按需启用，不影响基础记录":category==="本地分析"?"只连接设置中明确配置的本机服务":"影响受保护诊断功能的运行条件"}}</p></div><span>{{capabilityReport.capabilities.filter(item=>item.category===category&&item.status==="available").length}} / {{capabilityReport.capabilities.filter(item=>item.category===category).length}} 可用</span></header>
+        <div v-for="item in capabilityReport.capabilities.filter(item=>item.category===category)" class="capability-row"><span :class="['capability-icon',item.status]"><component :is="capabilityIcon(item)"/></span><div class="capability-main"><div><b>{{item.name}}</b><span v-if="item.required_now" class="required-tag">当前使用</span><span v-else class="optional-tag">可选</span></div><p>{{item.usage}}</p><small>{{item.detail}}</small><code v-if="item.path">{{item.path}}</code><aside v-if="item.recommendation"><TriangleAlert/>{{item.recommendation}}</aside></div><div class="capability-state"><span :class="item.status"><CircleCheck v-if="item.status==='available'"/><CircleX v-else-if="['unavailable','degraded','misconfigured'].includes(item.status)"/><TriangleAlert v-else/>{{capabilityStatus(item.status)}}</span><small v-if="item.requires_admin">需要管理员权限</small><small v-if="item.version">{{item.version}}</small></div></div>
+      </article>
     </section>
 
     <section v-else-if="page==='privacy'" class="page"><div class="privacy panel"><ShieldCheck/><div><h2>默认零上传</h2><p>无需账号、无遥测。原始日志与事故包始终保存在此设备。</p></div></div><div class="columns"><article class="panel"><h3>当前收集的数据</h3><ul><li><Check/>CPU、内存、磁盘性能指标 <em>Level 0</em></li><li><Check/>进程与事件 Provider <em>Level 1</em></li><li><X/>键盘、屏幕、文件内容 <em>不收集</em></li></ul><p>当前最高敏感等级：Level {{dashboard.sensitivity_level_max}}</p></article><article class="panel"><h3>本地存储</h3><p>{{incidents.length}} 条事故 · 事故包 {{fmt(dashboard.incident_storage_bytes)}} · 循环数据 {{fmt(dashboard.storage_bytes)}}</p><code class="data-path">{{dashboard.data_path}}</code><div class="storage-actions"><button class="secondary" @click="reveal(dashboard.data_path)"><FolderOpen/>定位数据目录</button><button class="danger" @click="removeAll"><Trash2/>删除所有本地数据</button></div></article></div></section>

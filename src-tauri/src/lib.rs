@@ -1,5 +1,6 @@
 mod ai;
 mod analysis;
+mod capabilities;
 mod collector;
 mod storage;
 
@@ -427,6 +428,21 @@ fn get_dashboard(s: State<AppState>) -> Dashboard {
     }
 }
 #[tauri::command]
+async fn get_diagnostic_capabilities(
+    s: State<'_, AppState>,
+) -> Result<capabilities::CapabilityReport, String> {
+    let settings: Settings = read_json(&settings_path(&s)).unwrap_or_default();
+    let logman_status = s
+        .logman_status
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let report = capabilities::detect(&s.root, &settings, &logman_status).await;
+    let _guard = s.io_lock.lock().unwrap_or_else(|error| error.into_inner());
+    write_json(&s.root.join("capabilities.json"), &report)?;
+    Ok(report)
+}
+#[tauri::command]
 fn set_monitoring(s: State<AppState>, enabled: bool) -> Dashboard {
     s.monitoring.store(enabled, Ordering::Relaxed);
     let settings: Settings = read_json(&settings_path(&s)).unwrap_or_default();
@@ -521,6 +537,13 @@ fn create_incident_internal(
     write_json(&dir.join("incident.json"), &incident)?;
     write_json(&dir.join("user_report.json"), &draft)?;
     write_json(&dir.join("evidence/system_snapshot.json"), latest)?;
+    if root.join("capabilities.json").is_file() {
+        fs::copy(
+            root.join("capabilities.json"),
+            dir.join("evidence/capabilities.json"),
+        )
+        .map_err(|error| error.to_string())?;
+    }
     write_json(
         &dir.join("evidence/process_snapshot.json"),
         &serde_json::json!({
@@ -1097,6 +1120,7 @@ pub fn run() {
             save_settings,
             list_incidents,
             get_dashboard,
+            get_diagnostic_capabilities,
             set_monitoring,
             create_incident,
             get_incident,

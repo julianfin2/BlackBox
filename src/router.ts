@@ -6,7 +6,7 @@ export const router = createRouter({
   routes: [
     { path: "/", redirect: "/dashboard" },
     {
-      path: "/:section(dashboard|incidents|privacy|settings)",
+      path: "/:section(dashboard|incidents|capabilities|privacy|settings)",
       name: "workspace",
       component: DesktopApp,
     },
