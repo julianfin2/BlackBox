@@ -640,7 +640,7 @@ async fn analyze_incident(s: State<'_, AppState>, id: String) -> Result<Detail, 
 
 fn write_report_markdown(path: &Path, incident: &Incident, report: &Report) -> Result<(), String> {
     let mut markdown = format!(
-        "# System BlackBox 事故报告\n\n- 事故 ID：{}\n- 症状：{}\n- 触发时间：{}\n- 触发来源：{}\n- 应用版本：{}\n- 生成方式：{}\n\n## 摘要\n\n{}\n\n## 可能原因\n\n",
+        "# 系统黑盒子事故报告\n\n- 事故 ID：{}\n- 症状：{}\n- 触发时间：{}\n- 触发来源：{}\n- 应用版本：{}\n- 生成方式：{}\n\n## 摘要\n\n{}\n\n## 可能原因\n\n",
         incident.id,
         incident.symptom_label,
         incident.trigger_time,
@@ -795,7 +795,7 @@ fn resolve_recovery(s: State<AppState>, create: bool) -> Result<Option<Detail>, 
             severity: "high".into(),
             duration_seconds: 0,
             still_happening: false,
-            description: "检测到上次 System BlackBox 会话未正常结束".into(),
+            description: "检测到上次系统黑盒子会话未正常结束".into(),
         },
         trigger_time,
         "recovery",
@@ -1040,7 +1040,7 @@ pub fn run() {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) = shortcut_status;
 
-            let show = MenuItem::with_id(app, "show", "打开 System BlackBox", true, None::<&str>)?;
+            let show = MenuItem::with_id(app, "show", "打开系统黑盒子", true, None::<&str>)?;
             let mark = MenuItem::with_id(app, "mark", "立即标记事故", true, None::<&str>)?;
             let freeze = MenuItem::with_id(app, "freeze", "系统卡死 / 无响应", true, None::<&str>)?;
             let network = MenuItem::with_id(app, "network", "网络缓慢", true, None::<&str>)?;
@@ -1049,7 +1049,7 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&show, &mark, &freeze, &network, &app_hang, &quit])?;
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().expect("default icon").clone())
-                .tooltip("System BlackBox · 监控正在运行")
+                .tooltip("系统黑盒子 · 监控正在运行")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {

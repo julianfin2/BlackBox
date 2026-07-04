@@ -48,7 +48,7 @@ let timer=0;onMounted(async()=>{try{[settings.value,recovery.value]=await Promis
 
 <template>
 <div class="shell">
-  <aside><div class="brand"><span><Activity/></span><div><b>System BlackBox</b><small>系统故障记录器</small></div></div>
+  <aside><div class="brand"><span><Activity/></span><div><b>系统黑盒子</b><small>系统故障记录器</small></div></div>
     <nav><button v-for="n in nav" :class="{active:page===n.id}" @click="page=n.id;selected=null"><component :is="n.icon"/>{{n.label}}</button></nav>
     <footer><p><i :class="{live:dashboard.monitoring}"></i>{{dashboard.monitoring?"监控正在运行":"监控已暂停"}}</p><small>Ctrl + Shift + F12 快速标记</small><small>数据仅保存在此设备</small></footer>
   </aside>
