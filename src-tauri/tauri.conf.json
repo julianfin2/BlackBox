@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "blackbox",
+  "productName": "System BlackBox",
   "version": "0.1.0",
   "identifier": "top.volan.blackbox",
   "build": {
@@ -12,9 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "blackbox",
-        "width": 800,
-        "height": 600
+        "title": "System BlackBox",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true
       }
     ],
     "security": {
