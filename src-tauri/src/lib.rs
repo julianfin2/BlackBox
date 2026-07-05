@@ -121,11 +121,40 @@ struct Track {
     label: String,
     points: Vec<Point>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct RawFile {
     name: String,
     kind: String,
     size_bytes: u64,
+}
+#[derive(Serialize)]
+struct CollectionField {
+    label: String,
+    value: String,
+}
+#[derive(Serialize)]
+struct CollectionCategory {
+    id: String,
+    label: String,
+    description: String,
+    status: String,
+    quantity: String,
+    coverage: Option<String>,
+    sensitivity_level: u8,
+    size_bytes: u64,
+    source_files: Vec<String>,
+    details: Vec<CollectionField>,
+}
+#[derive(Serialize)]
+struct CollectionSummary {
+    status: String,
+    planned_window: String,
+    actual_coverage: String,
+    sample_count: usize,
+    event_count: usize,
+    total_size_bytes: u64,
+    sensitivity_level: u8,
+    categories: Vec<CollectionCategory>,
 }
 #[derive(Serialize)]
 struct Detail {
@@ -135,6 +164,7 @@ struct Detail {
     timeline: Vec<Track>,
     report: Option<Report>,
     raw_files: Vec<RawFile>,
+    collection: CollectionSummary,
     data_path: String,
 }
 #[derive(Serialize)]
@@ -265,6 +295,385 @@ fn dir_size(path: &Path) -> u64 {
         })
         .unwrap_or(0)
 }
+fn format_duration(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let remaining = seconds % 60;
+    if remaining == 0 {
+        format!("{minutes} 分钟")
+    } else if minutes == 0 {
+        format!("{remaining} 秒")
+    } else {
+        format!("{minutes} 分 {remaining} 秒")
+    }
+}
+fn format_offset(milliseconds: i64) -> String {
+    let sign = if milliseconds < 0 { "−" } else { "+" };
+    let seconds = milliseconds.unsigned_abs() / 1000;
+    let minutes = seconds / 60;
+    let remaining = seconds % 60;
+    if minutes == 0 {
+        format!("{sign}{remaining} 秒")
+    } else if remaining == 0 {
+        format!("{sign}{minutes} 分钟")
+    } else {
+        format!("{sign}{minutes} 分 {remaining} 秒")
+    }
+}
+fn count_xml_events(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .map(|content| {
+            content
+                .match_indices("<Event")
+                .filter(|(index, _)| {
+                    content[*index + 6..]
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character == '>' || character.is_whitespace())
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+fn collection_field(label: &str, value: impl Into<String>) -> CollectionField {
+    CollectionField {
+        label: label.into(),
+        value: value.into(),
+    }
+}
+fn source_size(raw_files: &[RawFile], names: &[&str]) -> u64 {
+    raw_files
+        .iter()
+        .filter(|file| names.contains(&file.name.as_str()))
+        .map(|file| file.size_bytes)
+        .sum()
+}
+fn source_names(raw_files: &[RawFile], names: &[&str]) -> Vec<String> {
+    raw_files
+        .iter()
+        .filter(|file| names.contains(&file.name.as_str()))
+        .map(|file| file.name.clone())
+        .collect()
+}
+fn collection_status(incident: &Incident, available: bool) -> String {
+    if available {
+        "available"
+    } else if ["capturing", "freezing", "extracting"].contains(&incident.status.as_str()) {
+        "pending"
+    } else if incident.status == "failed" {
+        "failed"
+    } else {
+        "missing"
+    }
+    .into()
+}
+fn build_collection(
+    dir: &Path,
+    incident: &Incident,
+    observations: &[Observation],
+    report: &Option<Report>,
+    raw_files: &[RawFile],
+) -> CollectionSummary {
+    let metrics: Vec<collector::Sample> = fs::read_to_string(dir.join("evidence/metrics.jsonl"))
+        .map(|content| {
+            content
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let trigger_ms = chrono::DateTime::parse_from_rfc3339(&incident.trigger_time)
+        .map(|time| time.timestamp_millis())
+        .unwrap_or_default();
+    let actual_coverage = metrics
+        .first()
+        .zip(metrics.last())
+        .map(|(first, last)| {
+            format!(
+                "{} 至 {}",
+                format_offset(first.timestamp_ms - trigger_ms),
+                format_offset(last.timestamp_ms - trigger_ms)
+            )
+        })
+        .unwrap_or_else(|| {
+            if ["capturing", "freezing", "extracting"].contains(&incident.status.as_str()) {
+                "正在生成".into()
+            } else {
+                "无性能样本".into()
+            }
+        });
+    let system_events = count_xml_events(&dir.join("evidence/system.xml"));
+    let application_events = count_xml_events(&dir.join("evidence/application.xml"));
+    let event_count = system_events + application_events;
+    let process: serde_json::Value =
+        read_json(&dir.join("evidence/process_snapshot.json")).unwrap_or_default();
+    let capabilities: Option<capabilities::CapabilityReport> =
+        read_json(&dir.join("evidence/capabilities.json")).ok();
+    let user_report: Option<IncidentDraft> = read_json(&dir.join("user_report.json")).ok();
+    let performance_sources = [
+        "evidence/system_snapshot.json",
+        "evidence/metrics.jsonl",
+        "evidence/performance.blg",
+        "evidence/performance-status.txt",
+    ];
+    let event_sources = [
+        "evidence/system.evtx",
+        "evidence/application.evtx",
+        "evidence/system.xml",
+        "evidence/application.xml",
+        "evidence/export-errors.txt",
+    ];
+    let derived_sources = [
+        "extracted/facts.json",
+        "report/report.json",
+        "report/report.md",
+        "pipeline-error.txt",
+    ];
+    let process_available = dir.join("evidence/process_snapshot.json").is_file();
+    let capability_available = capabilities.is_some();
+    let event_available = event_count > 0
+        || dir.join("evidence/system.evtx").is_file()
+        || dir.join("evidence/application.evtx").is_file();
+    let derived_available = dir.join("extracted/facts.json").is_file() || report.is_some();
+    let categories = vec![
+        CollectionCategory {
+            id: "incident".into(),
+            label: "事故信息".into(),
+            description: "用户标记故障时生成的时间、症状和窗口配置。".into(),
+            status: "available".into(),
+            quantity: "1 条事故记录".into(),
+            coverage: None,
+            sensitivity_level: 1,
+            size_bytes: source_size(raw_files, &["incident.json"]),
+            source_files: source_names(raw_files, &["incident.json"]),
+            details: vec![
+                collection_field("故障症状", &incident.symptom_label),
+                collection_field("严重程度", &incident.severity),
+                collection_field("触发来源", &incident.trigger_source),
+                collection_field("应用版本", &incident.app_version),
+            ],
+        },
+        CollectionCategory {
+            id: "performance".into(),
+            label: "性能指标".into(),
+            description: "CPU、内存、磁盘和网络的低开销时间序列。".into(),
+            status: collection_status(incident, !metrics.is_empty()),
+            quantity: format!("{} 个样本", metrics.len()),
+            coverage: Some(actual_coverage.clone()),
+            sensitivity_level: 0,
+            size_bytes: source_size(raw_files, &performance_sources),
+            source_files: source_names(raw_files, &performance_sources),
+            details: vec![
+                collection_field("实际覆盖", &actual_coverage),
+                collection_field(
+                    "计划窗口",
+                    format!(
+                        "故障前 {}，故障后 {}",
+                        format_duration(incident.pre_window_seconds),
+                        format_duration(incident.post_window_seconds)
+                    ),
+                ),
+                collection_field(
+                    "有效采样间隔",
+                    metrics
+                        .last()
+                        .map(|sample| format!("{} 秒", sample.effective_interval_seconds))
+                        .unwrap_or_else(|| "尚不可用".into()),
+                ),
+            ],
+        },
+        CollectionCategory {
+            id: "process".into(),
+            label: "进程状态".into(),
+            description: "标记事故时 CPU 占用最高的进程快照。".into(),
+            status: collection_status(incident, process_available),
+            quantity: if process_available {
+                "1 份快照".into()
+            } else {
+                "0 份快照".into()
+            },
+            coverage: None,
+            sensitivity_level: 1,
+            size_bytes: source_size(raw_files, &["evidence/process_snapshot.json"]),
+            source_files: source_names(raw_files, &["evidence/process_snapshot.json"]),
+            details: vec![
+                collection_field(
+                    "最高占用进程",
+                    process["top_process"].as_str().unwrap_or("未识别"),
+                ),
+                collection_field(
+                    "进程 CPU",
+                    process["cpu_percent"]
+                        .as_f64()
+                        .map(|value| format!("{value:.1}%"))
+                        .unwrap_or_else(|| "未知".into()),
+                ),
+            ],
+        },
+        CollectionCategory {
+            id: "events".into(),
+            label: "Windows 事件".into(),
+            description: "事故窗口内筛选的 System 与 Application 事件。".into(),
+            status: collection_status(incident, event_available),
+            quantity: format!("{event_count} 条筛选事件"),
+            coverage: Some(actual_coverage.clone()),
+            sensitivity_level: 2,
+            size_bytes: source_size(raw_files, &event_sources),
+            source_files: source_names(raw_files, &event_sources),
+            details: vec![
+                collection_field("System", format!("{system_events} 条")),
+                collection_field("Application", format!("{application_events} 条")),
+                collection_field(
+                    "原始 EVTX",
+                    if dir.join("evidence/system.evtx").is_file()
+                        || dir.join("evidence/application.evtx").is_file()
+                    {
+                        "已保存"
+                    } else {
+                        "未生成"
+                    },
+                ),
+            ],
+        },
+        CollectionCategory {
+            id: "environment".into(),
+            label: "诊断环境".into(),
+            description: "事故发生时可用的系统诊断组件与权限状态。".into(),
+            status: collection_status(incident, capability_available),
+            quantity: capabilities
+                .as_ref()
+                .map(|value| format!("{} 项能力", value.capabilities.len()))
+                .unwrap_or_else(|| "0 项能力".into()),
+            coverage: None,
+            sensitivity_level: 1,
+            size_bytes: source_size(raw_files, &["evidence/capabilities.json"]),
+            source_files: source_names(raw_files, &["evidence/capabilities.json"]),
+            details: vec![
+                collection_field(
+                    "可用能力",
+                    capabilities
+                        .as_ref()
+                        .map(|value| format!("{} 项", value.available))
+                        .unwrap_or_else(|| "未知".into()),
+                ),
+                collection_field(
+                    "需要处理",
+                    capabilities
+                        .as_ref()
+                        .map(|value| format!("{} 项", value.attention))
+                        .unwrap_or_else(|| "未知".into()),
+                ),
+                collection_field(
+                    "提升权限",
+                    capabilities
+                        .as_ref()
+                        .map(|value| if value.is_elevated { "是" } else { "否" })
+                        .unwrap_or("未知"),
+                ),
+            ],
+        },
+        CollectionCategory {
+            id: "user_report".into(),
+            label: "用户报告".into(),
+            description: "标记事故时由用户主动选择或填写的信息。".into(),
+            status: collection_status(incident, user_report.is_some()),
+            quantity: "1 份报告".into(),
+            coverage: None,
+            sensitivity_level: 2,
+            size_bytes: source_size(raw_files, &["user_report.json"]),
+            source_files: source_names(raw_files, &["user_report.json"]),
+            details: vec![
+                collection_field(
+                    "持续时间",
+                    user_report
+                        .as_ref()
+                        .map(|value| format_duration(value.duration_seconds))
+                        .unwrap_or_else(|| "未知".into()),
+                ),
+                collection_field(
+                    "仍在发生",
+                    user_report
+                        .as_ref()
+                        .map(|value| if value.still_happening { "是" } else { "否" })
+                        .unwrap_or("未知"),
+                ),
+                collection_field(
+                    "补充描述",
+                    user_report
+                        .as_ref()
+                        .map(|value| {
+                            if value.description.trim().is_empty() {
+                                "未填写".into()
+                            } else {
+                                value.description.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| "未填写".into()),
+                ),
+            ],
+        },
+        CollectionCategory {
+            id: "derived".into(),
+            label: "程序生成的数据".into(),
+            description: "从本地证据提取的观察结果和分析报告，不是额外采集。".into(),
+            status: collection_status(incident, derived_available),
+            quantity: format!(
+                "{} 条观察 · {}",
+                observations.len(),
+                if report.is_some() {
+                    "1 份报告"
+                } else {
+                    "无报告"
+                }
+            ),
+            coverage: None,
+            sensitivity_level: 1,
+            size_bytes: source_size(raw_files, &derived_sources),
+            source_files: source_names(raw_files, &derived_sources),
+            details: vec![
+                collection_field("结构化观察", format!("{} 条", observations.len())),
+                collection_field(
+                    "分析报告",
+                    if report.is_some() {
+                        "已生成"
+                    } else {
+                        "未生成"
+                    },
+                ),
+                collection_field("数据来源", "仅来自本事故包的本地证据"),
+            ],
+        },
+    ];
+    let partial = categories
+        .iter()
+        .any(|category| ["missing", "failed"].contains(&category.status.as_str()));
+    CollectionSummary {
+        status: if ["capturing", "freezing", "extracting"].contains(&incident.status.as_str()) {
+            "pending"
+        } else if incident.status == "failed" {
+            "failed"
+        } else if partial {
+            "partial"
+        } else {
+            "complete"
+        }
+        .into(),
+        planned_window: format!(
+            "−{} / +{}",
+            format_duration(incident.pre_window_seconds),
+            format_duration(incident.post_window_seconds)
+        ),
+        actual_coverage,
+        sample_count: metrics.len(),
+        event_count,
+        total_size_bytes: dir_size(dir),
+        sensitivity_level: categories
+            .iter()
+            .map(|category| category.sensitivity_level)
+            .max()
+            .unwrap_or(0),
+        categories,
+    }
+}
 fn load_incidents(s: &AppState) -> Vec<Incident> {
     let mut v: Vec<Incident> = fs::read_dir(incidents_dir(s))
         .map(|r| {
@@ -334,6 +743,7 @@ fn build_detail(s: &AppState, i: Incident) -> Result<Detail, String> {
         "incident.json",
         "user_report.json",
         "evidence/system_snapshot.json",
+        "evidence/capabilities.json",
         "evidence/process_snapshot.json",
         "evidence/metrics.jsonl",
         "evidence/performance.blg",
@@ -352,15 +762,21 @@ fn build_detail(s: &AppState, i: Incident) -> Result<Detail, String> {
         if let Ok(m) = fs::metadata(&p) {
             raw.push(RawFile {
                 name: name.into(),
-                kind: if name.ends_with(".json") {
-                    "JSON".into()
-                } else {
-                    "原始证据".into()
-                },
+                kind: match Path::new(name).extension().and_then(|value| value.to_str()) {
+                    Some("json") => "JSON",
+                    Some("jsonl") => "JSON Lines",
+                    Some("evtx") => "Windows 事件日志",
+                    Some("blg") => "Windows 性能日志",
+                    Some("xml") => "筛选事件 XML",
+                    Some("md") => "Markdown 报告",
+                    _ => "状态日志",
+                }
+                .into(),
                 size_bytes: m.len(),
             })
         }
     }
+    let collection = build_collection(&dir, &i, &observations, &report, &raw);
     Ok(Detail {
         incident: i,
         pinned: dir.join(".pinned").exists(),
@@ -368,6 +784,7 @@ fn build_detail(s: &AppState, i: Incident) -> Result<Detail, String> {
         timeline,
         report,
         raw_files: raw,
+        collection,
         data_path: dir.to_string_lossy().into(),
     })
 }
@@ -565,7 +982,7 @@ fn create_incident_internal(
         },
         likely_cause: None,
         confidence: None,
-        sensitivity_level: 1,
+        sensitivity_level: 2,
         machine_id: load_or_create_machine_id(root)?,
         app_version: env!("CARGO_PKG_VERSION").into(),
     };
@@ -1321,6 +1738,70 @@ mod tests {
         enforce_incident_retention(&root.0, &Settings::default()).unwrap();
         assert!(!root.0.join("incidents/expired").exists());
         assert!(root.0.join("incidents/pinned").exists());
+    }
+
+    #[test]
+    fn collection_summary_uses_actual_samples_and_filtered_events() {
+        let root = TestDirectory::new();
+        add_incident(&root.0, "summary", 0, false);
+        let directory = root.0.join("incidents/summary");
+        fs::create_dir_all(directory.join("evidence")).unwrap();
+        let incident: Incident = read_json(&directory.join("incident.json")).unwrap();
+        let trigger_ms = chrono::DateTime::parse_from_rfc3339(&incident.trigger_time)
+            .unwrap()
+            .timestamp_millis();
+        let samples = [
+            collector::Sample {
+                timestamp_ms: trigger_ms - 30_000,
+                timestamp: incident.trigger_time.clone(),
+                effective_interval_seconds: 2,
+                ..Default::default()
+            },
+            collector::Sample {
+                timestamp_ms: trigger_ms + 10_000,
+                timestamp: incident.trigger_time.clone(),
+                effective_interval_seconds: 2,
+                ..Default::default()
+            },
+        ];
+        fs::write(
+            directory.join("evidence/metrics.jsonl"),
+            samples
+                .iter()
+                .map(|sample| serde_json::to_string(sample).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("evidence/system.xml"),
+            "<Events><Event><System /></Event><Event><System /></Event></Events>",
+        )
+        .unwrap();
+        fs::write(
+            directory.join("evidence/application.xml"),
+            "<Events><Event><System /></Event></Events>",
+        )
+        .unwrap();
+        let raw_files = [
+            "evidence/metrics.jsonl",
+            "evidence/system.xml",
+            "evidence/application.xml",
+        ]
+        .into_iter()
+        .map(|name| RawFile {
+            name: name.into(),
+            kind: "test".into(),
+            size_bytes: fs::metadata(directory.join(name)).unwrap().len(),
+        })
+        .collect::<Vec<_>>();
+
+        let summary = build_collection(&directory, &incident, &[], &None, &raw_files);
+
+        assert_eq!(summary.sample_count, 2);
+        assert_eq!(summary.event_count, 3);
+        assert_eq!(summary.actual_coverage, "−30 秒 至 +10 秒");
+        assert_eq!(summary.sensitivity_level, 2);
     }
 
     #[test]

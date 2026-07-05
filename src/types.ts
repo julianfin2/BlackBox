@@ -5,7 +5,10 @@ export interface Incident { schema_version: number; id: string; created_at: stri
 export interface Observation { id: string; title: string; description: string; source: string; category: string; offset_ms: number; severity: "info" | "warning" | "critical"; value: number | null; unit: string | null }
 export interface Report { summary: string; likely_causes: { title: string; confidence: number; explanation: string; supporting_evidence_ids: string[] }[]; next_tests: { title: string; description: string; priority: number }[]; generated_by: string }
 export interface TimelineTrack { label: string; points: { id: string; title: string; offset_ms: number; severity: string }[] }
-export interface IncidentDetail { incident: Incident; pinned: boolean; observations: Observation[]; timeline: TimelineTrack[]; report: Report | null; raw_files: { name: string; kind: string; size_bytes: number }[]; data_path: string }
+export type CollectionStatus = "available" | "pending" | "missing" | "failed";
+export interface CollectionCategory { id: string; label: string; description: string; status: CollectionStatus; quantity: string; coverage: string | null; sensitivity_level: number; size_bytes: number; source_files: string[]; details: { label: string; value: string }[] }
+export interface CollectionSummary { status: "complete" | "pending" | "partial" | "failed"; planned_window: string; actual_coverage: string; sample_count: number; event_count: number; total_size_bytes: number; sensitivity_level: number; categories: CollectionCategory[] }
+export interface IncidentDetail { incident: Incident; pinned: boolean; observations: Observation[]; timeline: TimelineTrack[]; report: Report | null; raw_files: { name: string; kind: string; size_bytes: number }[]; collection: CollectionSummary; data_path: string }
 export interface AppSettings { sample_interval_seconds: number; retention_days: number; rolling_limit_gb: number; incident_limit_gb: number; ai_mode: "disabled" | "ollama"; ollama_endpoint: string; ollama_model: string; dumps_enabled: boolean }
 export interface RecoveryCandidate { detected_at: string; previous_session_started_at: string; last_sample_at: string | null }
 export type CapabilityStatus = "available" | "degraded" | "unavailable" | "permission_required" | "not_installed" | "misconfigured" | "disabled";
