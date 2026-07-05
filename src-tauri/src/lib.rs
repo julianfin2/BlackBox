@@ -1,8 +1,11 @@
 mod ai;
 mod analysis;
+mod auto_trigger;
 mod capabilities;
 mod collector;
+mod service;
 mod storage;
+mod wpr;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -25,7 +28,7 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use uuid::Uuid;
 
-const INCIDENT_SCHEMA_VERSION: u32 = 3;
+const INCIDENT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Settings {
@@ -37,6 +40,9 @@ struct Settings {
     ollama_endpoint: String,
     ollama_model: String,
     dumps_enabled: bool,
+    auto_trigger_enabled: bool,
+    auto_trigger_cooldown_minutes: u64,
+    auto_trigger_max_per_hour: usize,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -49,10 +55,13 @@ impl Default for Settings {
             ollama_endpoint: "http://127.0.0.1:11434".into(),
             ollama_model: "qwen3:8b".into(),
             dumps_enabled: false,
+            auto_trigger_enabled: false,
+            auto_trigger_cooldown_minutes: 15,
+            auto_trigger_max_per_hour: 4,
         }
     }
 }
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct IncidentDraft {
     symptom: String,
     severity: String,
@@ -158,6 +167,8 @@ struct DiagnosticMetricPoint {
     disk_write_bytes_per_sec: u64,
     disk_latency_ms: f64,
     disk_queue_length: f64,
+    dpc_percent: f64,
+    interrupt_percent: f64,
     network_bytes_per_sec: u64,
     network_errors: u64,
     network_discards: u64,
@@ -225,6 +236,7 @@ struct Dashboard {
     incident_storage_bytes: u64,
     storage_limit_bytes: u64,
     etw_status: String,
+    wpr_status: String,
     cpu_percent: f32,
     memory_percent: f64,
     disk_latency_ms: f64,
@@ -238,6 +250,36 @@ struct Dashboard {
     effective_interval_seconds: u64,
     shortcut_status: String,
 }
+#[derive(Serialize)]
+struct IncidentPattern {
+    title: String,
+    category: String,
+    symptom: String,
+    symptom_label: String,
+    occurrence_count: usize,
+    comparable_incidents: usize,
+    occurrence_ratio: f64,
+    average_offset_ms: i64,
+    earliest_offset_ms: i64,
+    latest_offset_ms: i64,
+    near_trigger_count: usize,
+    severity: String,
+    last_seen_at: String,
+    incident_ids: Vec<String>,
+}
+#[derive(Serialize)]
+struct SymptomCount {
+    symptom: String,
+    label: String,
+    count: usize,
+}
+#[derive(Serialize)]
+struct PatternAnalysis {
+    incident_count: usize,
+    analyzed_incident_count: usize,
+    symptoms: Vec<SymptomCount>,
+    patterns: Vec<IncidentPattern>,
+}
 #[derive(Serialize, Deserialize, Clone)]
 struct RecoveryCandidate {
     detected_at: String,
@@ -250,10 +292,13 @@ struct AppState {
     monitoring: Arc<AtomicBool>,
     latest: Arc<Mutex<collector::Sample>>,
     logman_status: Mutex<String>,
+    wpr_status: Mutex<String>,
     recovery: Mutex<Option<RecoveryCandidate>>,
     io_lock: Arc<Mutex<()>>,
     incident_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     shortcut_status: Mutex<String>,
+    service_backed: AtomicBool,
+    local_collector_started: AtomicBool,
 }
 
 type IncidentCancellations = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
@@ -461,7 +506,9 @@ fn build_collection(
         "evidence/system_snapshot.json",
         "evidence/metrics.jsonl",
         "evidence/performance.blg",
+        "evidence/high-precision.etl",
         "evidence/performance-status.txt",
+        "evidence/wpr-status.txt",
     ];
     let event_sources = [
         "evidence/system.evtx",
@@ -526,6 +573,22 @@ fn build_collection(
                         .last()
                         .map(|sample| format!("{} 秒", sample.effective_interval_seconds))
                         .unwrap_or_else(|| "尚不可用".into()),
+                ),
+                collection_field(
+                    "WPR 高精度 ETL",
+                    raw_files
+                        .iter()
+                        .find(|file| file.name == "evidence/high-precision.etl")
+                        .map(|file| format!("已冻结（{}）", format_bytes(file.size_bytes)))
+                        .unwrap_or_else(|| {
+                            if ["capturing", "freezing", "extracting"]
+                                .contains(&incident.status.as_str())
+                            {
+                                "等待冻结".into()
+                            } else {
+                                "未生成，请检查 wpr-status.txt".into()
+                            }
+                        }),
                 ),
             ],
         },
@@ -778,6 +841,8 @@ fn build_diagnostics(
             disk_write_bytes_per_sec: sample.disk_write_bytes_per_sec,
             disk_latency_ms: sample.disk_latency_ms,
             disk_queue_length: sample.disk_queue_length,
+            dpc_percent: sample.dpc_percent,
+            interrupt_percent: sample.interrupt_percent,
             network_bytes_per_sec: sample.network_bytes_per_sec,
             network_errors: sample.network_errors,
             network_discards: sample.network_discards,
@@ -1018,7 +1083,10 @@ fn format_bytes(value: u64) -> String {
     }
 }
 fn load_incidents(s: &AppState) -> Vec<Incident> {
-    let mut v: Vec<Incident> = fs::read_dir(incidents_dir(s))
+    load_incidents_from_root(&s.root)
+}
+fn load_incidents_from_root(root: &Path) -> Vec<Incident> {
+    let mut v: Vec<Incident> = fs::read_dir(root.join("incidents"))
         .map(|r| {
             r.flatten()
                 .filter_map(|e| read_json(&e.path().join("incident.json")).ok())
@@ -1076,11 +1144,13 @@ fn build_detail(s: &AppState, i: Incident) -> Result<Detail, String> {
         "evidence/process_snapshot.json",
         "evidence/metrics.jsonl",
         "evidence/performance.blg",
+        "evidence/high-precision.etl",
         "evidence/system.evtx",
         "evidence/application.evtx",
         "evidence/system.xml",
         "evidence/application.xml",
         "evidence/performance-status.txt",
+        "evidence/wpr-status.txt",
         "evidence/export-errors.txt",
         "extracted/facts.json",
         "report/report.json",
@@ -1096,6 +1166,7 @@ fn build_detail(s: &AppState, i: Incident) -> Result<Detail, String> {
                     Some("jsonl") => "JSON Lines",
                     Some("evtx") => "Windows 事件日志",
                     Some("blg") => "Windows 性能日志",
+                    Some("etl") => "Windows 高精度 ETW 跟踪",
                     Some("xml") => "筛选事件 XML",
                     Some("md") => "Markdown 报告",
                     _ => "状态日志",
@@ -1127,7 +1198,10 @@ fn get_settings(s: State<AppState>) -> Settings {
 fn save_settings(s: State<AppState>, settings: Settings) -> Result<Settings, String> {
     validate_settings(&settings)?;
     write_json(&settings_path(&s), &settings)?;
-    if s.monitoring.load(Ordering::Relaxed) {
+    if s.service_backed.load(Ordering::Acquire) {
+        service::reload_settings(&s.root);
+    }
+    if !s.service_backed.load(Ordering::Acquire) && s.monitoring.load(Ordering::Relaxed) {
         let status = collector::start_logman(
             &s.root,
             settings.sample_interval_seconds,
@@ -1166,6 +1240,12 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
     if settings.dumps_enabled {
         return Err("MVP 尚未启用 Dump 采集；该高敏感功能保持关闭".into());
     }
+    if !(1..=120).contains(&settings.auto_trigger_cooldown_minutes) {
+        return Err("自动触发冷却时间必须在 1–120 分钟之间".into());
+    }
+    if !(1..=12).contains(&settings.auto_trigger_max_per_hour) {
+        return Err("自动触发每小时上限必须在 1–12 次之间".into());
+    }
     Ok(())
 }
 #[tauri::command]
@@ -1173,16 +1253,167 @@ fn list_incidents(s: State<AppState>) -> Vec<Incident> {
     load_incidents(&s)
 }
 #[tauri::command]
+fn get_pattern_analysis(s: State<AppState>) -> PatternAnalysis {
+    build_pattern_analysis(&s.root)
+}
+
+fn build_pattern_analysis(root: &Path) -> PatternAnalysis {
+    #[derive(Default)]
+    struct Aggregate {
+        title: String,
+        category: String,
+        symptom: String,
+        symptom_label: String,
+        offsets: Vec<i64>,
+        severity: String,
+        last_seen_at: String,
+        incident_ids: Vec<String>,
+    }
+    let incidents = load_incidents_from_root(root);
+    let mut symptom_counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut analyzed_symptom_counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut aggregates: HashMap<(String, String, String), Aggregate> = HashMap::new();
+    let mut analyzed = 0;
+    for incident in &incidents {
+        *symptom_counts
+            .entry((incident.symptom.clone(), incident.symptom_label.clone()))
+            .or_default() += 1;
+        let facts_path = root
+            .join("incidents")
+            .join(&incident.id)
+            .join("extracted/facts.json");
+        let observations: Vec<Observation> = read_json(&facts_path).unwrap_or_default();
+        if facts_path.is_file() {
+            analyzed += 1;
+            *analyzed_symptom_counts
+                .entry((incident.symptom.clone(), incident.symptom_label.clone()))
+                .or_default() += 1;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for observation in observations {
+            if observation.severity == "info"
+                || !seen.insert((observation.title.clone(), observation.category.clone()))
+            {
+                continue;
+            }
+            let entry = aggregates
+                .entry((
+                    incident.symptom.clone(),
+                    observation.category.clone(),
+                    observation.title.clone(),
+                ))
+                .or_insert_with(|| Aggregate {
+                    title: observation.title.clone(),
+                    category: observation.category.clone(),
+                    symptom: incident.symptom.clone(),
+                    symptom_label: incident.symptom_label.clone(),
+                    severity: observation.severity.clone(),
+                    ..Default::default()
+                });
+            entry.offsets.push(observation.offset_ms);
+            entry.incident_ids.push(incident.id.clone());
+            if incident.created_at > entry.last_seen_at {
+                entry.last_seen_at = incident.created_at.clone();
+            }
+            if observation.severity == "critical" {
+                entry.severity = "critical".into();
+            }
+        }
+    }
+    let mut symptoms = symptom_counts
+        .iter()
+        .map(|((symptom, label), count)| SymptomCount {
+            symptom: symptom.clone(),
+            label: label.clone(),
+            count: *count,
+        })
+        .collect::<Vec<_>>();
+    symptoms.sort_by(|left, right| right.count.cmp(&left.count));
+    let mut patterns = aggregates
+        .into_values()
+        .map(|aggregate| {
+            let comparable = analyzed_symptom_counts
+                .get(&(aggregate.symptom.clone(), aggregate.symptom_label.clone()))
+                .copied()
+                .unwrap_or(0);
+            let occurrence_count = aggregate.incident_ids.len();
+            IncidentPattern {
+                title: aggregate.title,
+                category: aggregate.category,
+                symptom: aggregate.symptom,
+                symptom_label: aggregate.symptom_label,
+                occurrence_count,
+                comparable_incidents: comparable,
+                occurrence_ratio: if comparable == 0 {
+                    0.0
+                } else {
+                    occurrence_count as f64 / comparable as f64
+                },
+                average_offset_ms: if aggregate.offsets.is_empty() {
+                    0
+                } else {
+                    aggregate.offsets.iter().sum::<i64>() / aggregate.offsets.len() as i64
+                },
+                earliest_offset_ms: aggregate.offsets.iter().copied().min().unwrap_or(0),
+                latest_offset_ms: aggregate.offsets.iter().copied().max().unwrap_or(0),
+                near_trigger_count: aggregate
+                    .offsets
+                    .iter()
+                    .filter(|offset| (-5_000..=0).contains(*offset))
+                    .count(),
+                severity: aggregate.severity,
+                last_seen_at: aggregate.last_seen_at,
+                incident_ids: aggregate.incident_ids,
+            }
+        })
+        .filter(|pattern| pattern.occurrence_count >= 2)
+        .collect::<Vec<_>>();
+    patterns.sort_by(|left, right| {
+        right
+            .occurrence_ratio
+            .total_cmp(&left.occurrence_ratio)
+            .then_with(|| right.occurrence_count.cmp(&left.occurrence_count))
+    });
+    PatternAnalysis {
+        incident_count: incidents.len(),
+        analyzed_incident_count: analyzed,
+        symptoms,
+        patterns,
+    }
+}
+#[tauri::command]
 fn get_dashboard(s: State<AppState>) -> Dashboard {
     let cfg: Settings = read_json(&settings_path(&s)).unwrap_or_default();
+    let service_runtime = if s.service_backed.load(Ordering::Acquire) {
+        match service::runtime(&s.root) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                let detail = format!("Service IPC 异常：{error}");
+                *s.logman_status.lock().unwrap() = detail.clone();
+                *s.wpr_status.lock().unwrap() = detail;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(runtime) = &service_runtime {
+        s.monitoring.store(runtime.monitoring, Ordering::Relaxed);
+        *s.latest.lock().unwrap() = runtime.latest.clone();
+        *s.logman_status.lock().unwrap() = runtime.logman_status.clone();
+        *s.wpr_status.lock().unwrap() = runtime.wpr_status.clone();
+    }
     let sample = s.latest.lock().unwrap().clone();
     Dashboard {
         monitoring: s.monitoring.load(Ordering::Relaxed),
-        uptime_seconds: s.started.elapsed().as_secs(),
+        uptime_seconds: service_runtime
+            .map(|runtime| runtime.uptime_seconds)
+            .unwrap_or_else(|| s.started.elapsed().as_secs()),
         storage_bytes: dir_size(&s.root.join("rolling")),
         incident_storage_bytes: dir_size(&s.root.join("incidents")),
         storage_limit_bytes: cfg.rolling_limit_gb * 1_073_741_824,
         etw_status: s.logman_status.lock().unwrap().clone(),
+        wpr_status: s.wpr_status.lock().unwrap().clone(),
         cpu_percent: sample.cpu_percent,
         memory_percent: sample.memory_percent,
         disk_latency_ms: sample.disk_latency_ms,
@@ -1221,20 +1452,122 @@ async fn get_diagnostic_capabilities(
     Ok(report)
 }
 #[tauri::command]
-fn set_monitoring(s: State<AppState>, enabled: bool) -> Dashboard {
-    s.monitoring.store(enabled, Ordering::Relaxed);
-    let settings: Settings = read_json(&settings_path(&s)).unwrap_or_default();
-    let status = if enabled {
-        collector::start_logman(
-            &s.root,
+fn get_service_status(s: State<AppState>) -> service::ServiceStatus {
+    service::query(&s.root)
+}
+
+fn start_local_runtime(state: &AppState, enabled: bool) -> Result<(), String> {
+    if !state.local_collector_started.swap(true, Ordering::AcqRel) {
+        collector::spawn(
+            state.root.clone(),
+            state.monitoring.clone(),
+            state.latest.clone(),
+            state.io_lock.clone(),
+        );
+        auto_trigger::spawn(
+            state.root.clone(),
+            state.latest.clone(),
+            IncidentRuntime {
+                io_lock: state.io_lock.clone(),
+                monitoring: state.monitoring.clone(),
+                cancellations: state.incident_cancellations.clone(),
+            },
+            state.monitoring.clone(),
+        );
+    }
+    state.monitoring.store(enabled, Ordering::Release);
+    write_json(
+        &state.root.join("session.lock"),
+        &serde_json::json!({
+            "started_at": Utc::now().to_rfc3339(),
+            "last_sample_at": null
+        }),
+    )?;
+    let (logman_status, wpr_status) = if enabled {
+        let settings: Settings = read_json(&settings_path(state)).unwrap_or_default();
+        let logman = collector::start_logman(
+            &state.root,
             settings.sample_interval_seconds,
             settings.rolling_limit_gb * 768,
+        );
+        let wpr = wpr::start(&state.root);
+        (logman, wpr)
+    } else {
+        ("已暂停".into(), "已暂停".into())
+    };
+    *state
+        .logman_status
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = logman_status;
+    *state
+        .wpr_status
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = wpr_status;
+    Ok(())
+}
+
+#[tauri::command]
+fn install_service(s: State<AppState>) -> Result<service::ServiceStatus, String> {
+    let was_monitoring = s.monitoring.load(Ordering::Acquire);
+    s.monitoring.store(false, Ordering::Release);
+    collector::stop_logman();
+    wpr::stop(&s.root);
+    match service::install(&s.root) {
+        Ok(status) if status.running => {
+            s.service_backed.store(true, Ordering::Release);
+            if status.connected {
+                let _ = service::set_monitoring(&s.root, was_monitoring);
+            }
+            let _ = fs::remove_file(s.root.join("session.lock"));
+            Ok(service::query(&s.root))
+        }
+        Ok(status) => {
+            s.service_backed.store(false, Ordering::Release);
+            start_local_runtime(&s, was_monitoring)?;
+            Ok(status)
+        }
+        Err(error) => {
+            s.service_backed.store(false, Ordering::Release);
+            start_local_runtime(&s, was_monitoring)?;
+            Err(error)
+        }
+    }
+}
+#[tauri::command]
+fn uninstall_service(s: State<AppState>) -> Result<service::ServiceStatus, String> {
+    let was_monitoring = service::runtime(&s.root)
+        .map(|runtime| runtime.monitoring)
+        .unwrap_or_else(|_| s.monitoring.load(Ordering::Acquire));
+    let status = service::uninstall(&s.root)?;
+    s.service_backed.store(false, Ordering::Release);
+    start_local_runtime(&s, was_monitoring)?;
+    Ok(status)
+}
+#[tauri::command]
+fn set_monitoring(s: State<AppState>, enabled: bool) -> Dashboard {
+    if s.service_backed.load(Ordering::Acquire) {
+        let _ = service::set_monitoring(&s.root, enabled);
+        return get_dashboard(s);
+    }
+    let _guard = s.io_lock.lock().unwrap_or_else(|error| error.into_inner());
+    s.monitoring.store(enabled, Ordering::Relaxed);
+    let settings: Settings = read_json(&settings_path(&s)).unwrap_or_default();
+    let (status, wpr_status) = if enabled {
+        (
+            collector::start_logman(
+                &s.root,
+                settings.sample_interval_seconds,
+                settings.rolling_limit_gb * 768,
+            ),
+            wpr::start(&s.root),
         )
     } else {
         collector::stop_logman();
-        "已暂停".into()
+        wpr::stop(&s.root);
+        ("已暂停".into(), "已暂停".into())
     };
     *s.logman_status.lock().unwrap() = status;
+    *s.wpr_status.lock().unwrap() = wpr_status;
     let _ = storage::audit(
         &s.root,
         if enabled {
@@ -1245,6 +1578,7 @@ fn set_monitoring(s: State<AppState>, enabled: bool) -> Dashboard {
         None,
         None,
     );
+    drop(_guard);
     get_dashboard(s)
 }
 #[tauri::command]
@@ -1253,10 +1587,12 @@ fn create_incident(
     draft: IncidentDraft,
     trigger_time: Option<String>,
 ) -> Result<Detail, String> {
-    let latest = s.latest.lock().unwrap().clone();
-    if let Some(value) = trigger_time.as_deref() {
-        collector::parse_time(value)?;
+    if s.service_backed.load(Ordering::Acquire) {
+        let id = service::create_incident(&s.root, draft, trigger_time, "manual")?;
+        let incident = read_json(&incidents_dir(&s).join(&id).join("incident.json"))?;
+        return build_detail(&s, incident);
     }
+    let latest = s.latest.lock().unwrap().clone();
     let incident = create_incident_internal(
         &s.root,
         &latest,
@@ -1281,6 +1617,9 @@ fn create_incident_internal(
     runtime: IncidentRuntime,
 ) -> Result<Incident, String> {
     validate_incident_draft(&draft)?;
+    if let Some(value) = trigger_override.as_deref() {
+        collector::parse_time(value)?;
+    }
     if !["manual", "shortcut", "tray", "recovery", "automatic"].contains(&trigger_source) {
         return Err("事故触发来源无效".into());
     }
@@ -1709,6 +2048,8 @@ fn finalize_incident(
             return Ok(());
         }
         let _ = fs::write(evidence.join("performance-status.txt"), blg_status);
+        let wpr_status = wpr::freeze(root, &evidence, monitoring.load(Ordering::Relaxed));
+        let _ = fs::write(evidence.join("wpr-status.txt"), wpr_status);
         collector::export_event_logs(&evidence, start, end);
         if incident_cancelled(&cancellation) {
             return Ok(());
@@ -1807,7 +2148,6 @@ fn enforce_incident_retention(root: &Path, settings: &Settings) -> Result<(), St
 
 fn quick_incident(app: &tauri::AppHandle, symptom: &str, severity: &str, trigger_source: &str) {
     let state = app.state::<AppState>();
-    let latest = state.latest.lock().unwrap().clone();
     let draft = IncidentDraft {
         symptom: symptom.into(),
         severity: severity.into(),
@@ -1815,6 +2155,11 @@ fn quick_incident(app: &tauri::AppHandle, symptom: &str, severity: &str, trigger
         still_happening: false,
         description: "通过全局快捷键或系统托盘快速标记".into(),
     };
+    if state.service_backed.load(Ordering::Acquire) {
+        let _ = service::create_incident(&state.root, draft, None, trigger_source);
+        return;
+    }
+    let latest = state.latest.lock().unwrap().clone();
     let _ = create_incident_internal(
         &state.root,
         &latest,
@@ -1866,6 +2211,7 @@ pub fn run() {
             let latest = Arc::new(Mutex::new(collector::Sample::default()));
             let io_lock = Arc::new(Mutex::new(()));
             let incident_cancellations = Arc::new(Mutex::new(HashMap::new()));
+            let service_backed = service::ping(&root);
             let previous_session: Option<serde_json::Value> =
                 read_json(&root.join("session.lock")).ok();
             let recovery = previous_session.map(|value| RecoveryCandidate {
@@ -1880,35 +2226,66 @@ pub fn run() {
                     .and_then(|value| value.as_str())
                     .map(str::to_owned),
             });
-            write_json(
-                &root.join("session.lock"),
-                &serde_json::json!({
-                    "started_at": Utc::now().to_rfc3339(),
-                    "last_sample_at": null
-                }),
-            )
-            .map_err(std::io::Error::other)?;
-            collector::spawn(
-                root.clone(),
-                monitoring.clone(),
-                latest.clone(),
-                io_lock.clone(),
-            );
-            let logman_status = collector::start_logman(
-                &root,
-                settings.sample_interval_seconds,
-                settings.rolling_limit_gb * 768,
-            );
+            let (logman_status, wpr_status) = if service_backed {
+                service::runtime(&root)
+                    .map(|runtime| {
+                        monitoring.store(runtime.monitoring, Ordering::Relaxed);
+                        *latest.lock().unwrap() = runtime.latest;
+                        (runtime.logman_status, runtime.wpr_status)
+                    })
+                    .unwrap_or_else(|error| {
+                        let detail = format!("Service IPC 异常：{error}");
+                        (detail.clone(), detail)
+                    })
+            } else {
+                write_json(
+                    &root.join("session.lock"),
+                    &serde_json::json!({
+                        "started_at": Utc::now().to_rfc3339(),
+                        "last_sample_at": null
+                    }),
+                )
+                .map_err(std::io::Error::other)?;
+                collector::spawn(
+                    root.clone(),
+                    monitoring.clone(),
+                    latest.clone(),
+                    io_lock.clone(),
+                );
+                let logman = collector::start_logman(
+                    &root,
+                    settings.sample_interval_seconds,
+                    settings.rolling_limit_gb * 768,
+                );
+                let wpr = wpr::start(&root);
+                (logman, wpr)
+            };
+            let incident_runtime = IncidentRuntime {
+                io_lock: io_lock.clone(),
+                monitoring: monitoring.clone(),
+                cancellations: incident_cancellations.clone(),
+            };
+            if !service_backed {
+                auto_trigger::spawn(
+                    root.clone(),
+                    latest.clone(),
+                    incident_runtime,
+                    monitoring.clone(),
+                );
+            }
             app.manage(AppState {
                 root,
                 started: Instant::now(),
                 monitoring,
                 latest,
                 logman_status: Mutex::new(logman_status),
+                wpr_status: Mutex::new(wpr_status),
                 recovery: Mutex::new(recovery),
                 io_lock,
                 incident_cancellations,
                 shortcut_status: Mutex::new("正在注册".into()),
+                service_backed: AtomicBool::new(service_backed),
+                local_collector_started: AtomicBool::new(!service_backed),
             });
 
             let shortcut_status = match app.global_shortcut().on_shortcut(
@@ -1950,9 +2327,12 @@ pub fn run() {
                     "network" => quick_incident(app, "network_slow", "medium", "tray"),
                     "app_hang" => quick_incident(app, "app_hang", "medium", "tray"),
                     "quit" => {
-                        collector::stop_logman();
                         let state = app.state::<AppState>();
-                        let _ = fs::remove_file(state.root.join("session.lock"));
+                        if !state.service_backed.load(Ordering::Acquire) {
+                            collector::stop_logman();
+                            wpr::stop(&state.root);
+                            let _ = fs::remove_file(state.root.join("session.lock"));
+                        }
                         app.exit(0);
                     }
                     _ => {}
@@ -1983,8 +2363,12 @@ pub fn run() {
             get_settings,
             save_settings,
             list_incidents,
+            get_pattern_analysis,
             get_dashboard,
             get_diagnostic_capabilities,
+            get_service_status,
+            install_service,
+            uninstall_service,
             set_monitoring,
             create_incident,
             get_incident,
@@ -2001,15 +2385,24 @@ pub fn run() {
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
             let state = app_handle.state::<AppState>();
-            state.monitoring.store(false, Ordering::Relaxed);
-            collector::stop_logman();
-            let _guard = state
-                .io_lock
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let _ = fs::remove_file(state.root.join("session.lock"));
+            if !state.service_backed.load(Ordering::Acquire) {
+                state.monitoring.store(false, Ordering::Relaxed);
+                collector::stop_logman();
+                wpr::stop(&state.root);
+                let _guard = state
+                    .io_lock
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let _ = fs::remove_file(state.root.join("session.lock"));
+            }
         }
     });
+}
+
+pub fn run_service() {
+    if let Err(error) = service::run_dispatcher() {
+        eprintln!("System BlackBox Service failed: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -2155,6 +2548,53 @@ mod tests {
             .highlights
             .iter()
             .any(|highlight| highlight.label == "CPU 峰值"));
+    }
+
+    #[test]
+    fn pattern_analysis_uses_analyzed_incidents_and_preserves_timing() {
+        let root = TestDirectory::new();
+        for id in ["pattern-a", "pattern-b", "pattern-empty"] {
+            add_incident(&root.0, id, 0, false);
+        }
+        for (id, offset_ms) in [("pattern-a", -4_000), ("pattern-b", -2_000)] {
+            write_json(
+                &root
+                    .0
+                    .join("incidents")
+                    .join(id)
+                    .join("extracted/facts.json"),
+                &vec![Observation {
+                    id: format!("disk-{id}"),
+                    title: "磁盘延迟峰值".into(),
+                    description: "测试观察".into(),
+                    source: "metrics".into(),
+                    category: "storage".into(),
+                    offset_ms,
+                    severity: "warning".into(),
+                    value: Some(700.0),
+                    unit: Some("ms".into()),
+                }],
+            )
+            .unwrap();
+        }
+        write_json(
+            &root.0.join("incidents/pattern-empty/extracted/facts.json"),
+            &Vec::<Observation>::new(),
+        )
+        .unwrap();
+
+        let analysis = build_pattern_analysis(&root.0);
+
+        assert_eq!(analysis.incident_count, 3);
+        assert_eq!(analysis.analyzed_incident_count, 3);
+        assert_eq!(analysis.patterns.len(), 1);
+        let pattern = &analysis.patterns[0];
+        assert_eq!(pattern.comparable_incidents, 3);
+        assert_eq!(pattern.occurrence_count, 2);
+        assert_eq!(pattern.near_trigger_count, 2);
+        assert_eq!(pattern.earliest_offset_ms, -4_000);
+        assert_eq!(pattern.latest_offset_ms, -2_000);
+        assert!((pattern.occurrence_ratio - 2.0 / 3.0).abs() < f64::EPSILON);
     }
 
     #[test]

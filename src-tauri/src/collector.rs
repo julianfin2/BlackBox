@@ -42,6 +42,8 @@ pub(crate) struct Sample {
     pub disk_write_bytes_per_sec: u64,
     pub disk_latency_ms: f64,
     pub disk_queue_length: f64,
+    pub dpc_percent: f64,
+    pub interrupt_percent: f64,
     pub network_bytes_per_sec: u64,
     pub network_errors: u64,
     pub network_discards: u64,
@@ -190,6 +192,8 @@ pub(crate) fn spawn(
                         disk_write_bytes_per_sec: disk_write / effective_interval.max(1),
                         disk_latency_ms: platform.disk_latency_ms,
                         disk_queue_length: platform.disk_queue_length,
+                        dpc_percent: platform.dpc_percent,
+                        interrupt_percent: platform.interrupt_percent,
                         network_bytes_per_sec: network / effective_interval.max(1),
                         network_errors: platform.network_errors,
                         network_discards: platform.network_discards,
@@ -251,6 +255,8 @@ struct PlatformMetrics {
     commit_percent: f64,
     disk_latency_ms: f64,
     disk_queue_length: f64,
+    dpc_percent: f64,
+    interrupt_percent: f64,
     network_errors: u64,
     network_discards: u64,
 }
@@ -260,6 +266,8 @@ struct WindowsMetrics {
     query: windows::Win32::System::Performance::PDH_HQUERY,
     latency: windows::Win32::System::Performance::PDH_HCOUNTER,
     queue: windows::Win32::System::Performance::PDH_HCOUNTER,
+    dpc: Option<windows::Win32::System::Performance::PDH_HCOUNTER>,
+    interrupt: Option<windows::Win32::System::Performance::PDH_HCOUNTER>,
     previous_errors: u64,
     previous_discards: u64,
     network_initialized: bool,
@@ -278,13 +286,17 @@ impl WindowsMetrics {
             let mut query = PDH_HQUERY::default();
             let mut latency = PDH_HCOUNTER::default();
             let mut queue = PDH_HCOUNTER::default();
-            if PdhOpenQueryW(None, 0, &mut query) != 0
-                || PdhAddEnglishCounterW(
-                    query,
-                    w!(r"\PhysicalDisk(_Total)\Avg. Disk sec/Transfer"),
-                    0,
-                    &mut latency,
-                ) != 0
+            let mut dpc = PDH_HCOUNTER::default();
+            let mut interrupt = PDH_HCOUNTER::default();
+            if PdhOpenQueryW(None, 0, &mut query) != 0 {
+                return None;
+            }
+            if PdhAddEnglishCounterW(
+                query,
+                w!(r"\PhysicalDisk(_Total)\Avg. Disk sec/Transfer"),
+                0,
+                &mut latency,
+            ) != 0
                 || PdhAddEnglishCounterW(
                     query,
                     w!(r"\PhysicalDisk(_Total)\Current Disk Queue Length"),
@@ -292,13 +304,27 @@ impl WindowsMetrics {
                     &mut queue,
                 ) != 0
             {
+                let _ = windows::Win32::System::Performance::PdhCloseQuery(query);
                 return None;
             }
+            let dpc =
+                (PdhAddEnglishCounterW(query, w!(r"\Processor(_Total)\% DPC Time"), 0, &mut dpc)
+                    == 0)
+                    .then_some(dpc);
+            let interrupt = (PdhAddEnglishCounterW(
+                query,
+                w!(r"\Processor(_Total)\% Interrupt Time"),
+                0,
+                &mut interrupt,
+            ) == 0)
+                .then_some(interrupt);
             let _ = PdhCollectQueryData(query);
             Some(Self {
                 query,
                 latency,
                 queue,
+                dpc,
+                interrupt,
                 previous_errors: 0,
                 previous_discards: 0,
                 network_initialized: false,
@@ -382,6 +408,8 @@ impl WindowsMetrics {
                 commit_percent,
                 disk_latency_ms: counter_value(self.latency) * 1000.0,
                 disk_queue_length: counter_value(self.queue),
+                dpc_percent: self.dpc.map(counter_value).unwrap_or_default(),
+                interrupt_percent: self.interrupt.map(counter_value).unwrap_or_default(),
                 network_errors,
                 network_discards,
             }

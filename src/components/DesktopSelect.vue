@@ -4,15 +4,15 @@ import { Check, ChevronDown } from "@lucide/vue";
 
 export interface DesktopSelectOption {
   label: string;
-  value: string | number;
+  value: string | number | boolean;
 }
 
 const props = defineProps<{
-  modelValue: string | number;
+  modelValue: string | number | boolean;
   options: DesktopSelectOption[];
   ariaLabel?: string;
 }>();
-const emit = defineEmits<{ "update:modelValue": [value: string | number] }>();
+const emit = defineEmits<{ "update:modelValue": [value: string | number | boolean] }>();
 
 const root = ref<HTMLElement | null>(null);
 const optionElements = ref<HTMLElement[]>([]);

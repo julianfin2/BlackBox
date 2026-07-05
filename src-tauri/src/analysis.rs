@@ -120,6 +120,24 @@ pub(crate) fn extract(
             Some("%"),
         );
     }
+    if let Some(sample) = sustained(
+        samples,
+        |sample| sample.dpc_percent + sample.interrupt_percent >= 25.0,
+        2,
+    ) {
+        push(
+            "DPC / ISR 占用异常".into(),
+            format!(
+                "DPC 与硬件中断占用连续多个采样点合计不低于 25%，记录值 DPC {:.1}%、ISR {:.1}%。",
+                sample.dpc_percent, sample.interrupt_percent
+            ),
+            "Scheduling",
+            sample,
+            "critical",
+            Some(sample.dpc_percent + sample.interrupt_percent),
+            Some("%"),
+        );
+    }
     if let Some(sample) = sustained(samples, |sample| sample.disk_latency_ms >= 500.0, 2) {
         push(
             "磁盘延迟严重升高".into(),
@@ -596,6 +614,8 @@ mod tests {
         first.commit_percent = 94.0;
         first.disk_latency_ms = 820.0;
         first.disk_queue_length = 8.0;
+        first.dpc_percent = 20.0;
+        first.interrupt_percent = 8.0;
         first.network_errors = 2;
         first.top_processes = vec![crate::collector::ProcessSample {
             pid: 42,
@@ -611,6 +631,7 @@ mod tests {
         let titles: Vec<_> = result.iter().map(|item| item.title.as_str()).collect();
         assert!(titles.contains(&"CPU 持续饱和"));
         assert!(titles.contains(&"内存 Commit 压力"));
+        assert!(titles.contains(&"DPC / ISR 占用异常"));
         assert!(titles.contains(&"磁盘延迟严重升高"));
         assert!(titles.contains(&"磁盘队列持续积压"));
         assert!(titles.contains(&"网络接口错误或丢弃"));

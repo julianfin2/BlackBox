@@ -2,5 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    blackbox_lib::run()
+    if std::env::args().any(|argument| argument == "--service") {
+        blackbox_lib::run_service();
+    } else {
+        blackbox_lib::run();
+    }
 }

@@ -205,6 +205,24 @@ fn native_capabilities() -> Vec<Capability> {
         }
         added
     };
+    let dpc_counters_ok = unsafe {
+        let mut query = PDH_HQUERY::default();
+        let mut dpc = PDH_HCOUNTER::default();
+        let mut interrupt = PDH_HCOUNTER::default();
+        let opened = PdhOpenQueryW(None, 0, &mut query) == 0;
+        let added = opened
+            && PdhAddEnglishCounterW(query, w!(r"\Processor(_Total)\% DPC Time"), 0, &mut dpc) == 0
+            && PdhAddEnglishCounterW(
+                query,
+                w!(r"\Processor(_Total)\% Interrupt Time"),
+                0,
+                &mut interrupt,
+            ) == 0;
+        if opened {
+            let _ = PdhCloseQuery(query);
+        }
+        added
+    };
     let memory_ok = unsafe {
         let mut memory = MEMORYSTATUSEX {
             dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
@@ -223,6 +241,12 @@ fn native_capabilities() -> Vec<Capability> {
 
     [
         ("pdh", "PDH 性能计数器", pdh_ok, "采集磁盘延迟与队列长度"),
+        (
+            "dpc_counters",
+            "DPC / ISR 性能计数器",
+            dpc_counters_ok,
+            "采集驱动延迟相关的 DPC 与硬件中断占用",
+        ),
         (
             "memory_api",
             "Windows 内存状态 API",
@@ -408,6 +432,45 @@ pub(crate) async fn detect(
     }
     capabilities.insert(0, privilege);
 
+    let service_status = crate::service::query(root);
+    let service_state = if service_status.connected {
+        "available"
+    } else if service_status.installed {
+        "degraded"
+    } else {
+        "not_installed"
+    };
+    let mut service = capability(
+        "service",
+        "系统黑盒子后台服务",
+        "运行环境",
+        service_state,
+        true,
+        "开机自动采集，并在界面关闭后继续保留事故前数据",
+        if service_status.connected {
+            "Windows Service 正在运行，版本化 Named Pipe IPC 已连接"
+        } else if service_status.running {
+            "Windows Service 正在运行，但 IPC 无法连接"
+        } else if service_status.installed {
+            "Windows Service 已安装但未运行"
+        } else {
+            "Windows Service 尚未安装，当前由桌面进程临时采集"
+        },
+    );
+    service.path = Some(r"\\.\pipe\SystemBlackBox.v1".into());
+    service.requires_admin = true;
+    if !service_status.connected {
+        service.recommendation = Some(
+            if service_status.installed {
+                "在设置中重新启动或重新安装后台采集服务"
+            } else {
+                "在设置中以管理员权限安装后台采集服务"
+            }
+            .into(),
+        );
+    }
+    capabilities.insert(1, service);
+
     let mut logman = executable_capability(ExecutableSpec {
         id: "logman",
         name: "logman 性能日志",
@@ -438,17 +501,36 @@ pub(crate) async fn detect(
         requires_admin: true,
         missing_recommendation: "修复 Windows Event Log 服务或系统组件",
     }));
-    capabilities.push(executable_capability(ExecutableSpec {
+    let mut wpr = executable_capability(ExecutableSpec {
         id: "wpr",
         name: "Windows Performance Recorder",
         category: "高级诊断",
-        required_now: false,
-        usage: "后续用于高精度 ETW 环形采集",
+        required_now: true,
+        usage: "维护内存环形 ETW 会话，并在事故发生时冻结为 ETL",
         path: system_tool("wpr.exe"),
-        probe_args: Some(&["-status"]),
+        probe_args: None,
         requires_admin: true,
         missing_recommendation: "安装与当前 Windows 匹配的 Windows Performance Toolkit",
-    }));
+    });
+    let wpr_runtime = crate::wpr::status(root);
+    if wpr_runtime.available {
+        wpr.status = if wpr_runtime.running {
+            "available"
+        } else {
+            "degraded"
+        }
+        .into();
+        wpr.detail = if wpr_runtime.running {
+            "WPR ETW 会话正在记录"
+        } else {
+            "WPR 可执行文件存在，但当前未检测到记录会话"
+        }
+        .into();
+        if !wpr_runtime.running {
+            wpr.recommendation = Some("启动监控，或检查管理员权限及 WPR 会话冲突".into());
+        }
+    }
+    capabilities.push(wpr);
 
     let tools = root.join("tools");
     let procdump = first_existing([tools.join("procdump64.exe"), tools.join("procdump.exe")])
@@ -525,11 +607,7 @@ pub(crate) async fn detect(
     let attention = capabilities
         .iter()
         .filter(|item| {
-            item.required_now
-                && !matches!(
-                    item.status.as_str(),
-                    "available" | "disabled" | "not_installed"
-                )
+            item.required_now && !matches!(item.status.as_str(), "available" | "disabled")
         })
         .count();
     CapabilityReport {
