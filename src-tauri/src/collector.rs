@@ -24,6 +24,7 @@ pub(crate) struct ProcessSample {
     pub pid: u32,
     pub name: String,
     pub cpu_percent: f32,
+    pub cpu_core_percent: f32,
     pub memory_bytes: u64,
     pub disk_read_bytes_per_sec: u64,
     pub disk_write_bytes_per_sec: u64,
@@ -49,6 +50,10 @@ pub(crate) struct Sample {
     pub blackbox_memory_bytes: u64,
     pub blackbox_disk_write_bytes_per_sec: u64,
     pub effective_interval_seconds: u64,
+}
+
+fn normalize_process_cpu(core_percent: f32, logical_processors: usize) -> f32 {
+    (core_percent / logical_processors.max(1) as f32).clamp(0.0, 100.0)
 }
 
 fn select_top_processes(mut processes: Vec<ProcessSample>, limit: usize) -> Vec<ProcessSample> {
@@ -122,6 +127,7 @@ pub(crate) fn spawn(
                     system.refresh_memory();
                     system.refresh_processes(ProcessesToUpdate::All, true);
                     networks.refresh(true);
+                    let logical_processors = system.cpus().len().max(1);
 
                     let disk_read: u64 = system
                         .processes()
@@ -143,10 +149,15 @@ pub(crate) fn spawn(
                             .values()
                             .map(|process| {
                                 let disk = process.disk_usage();
+                                let cpu_core_percent = process.cpu_usage();
                                 ProcessSample {
                                     pid: process.pid().as_u32(),
                                     name: process.name().to_string_lossy().into_owned(),
-                                    cpu_percent: process.cpu_usage(),
+                                    cpu_percent: normalize_process_cpu(
+                                        cpu_core_percent,
+                                        logical_processors,
+                                    ),
+                                    cpu_core_percent,
                                     memory_bytes: process.memory(),
                                     disk_read_bytes_per_sec: disk.read_bytes
                                         / effective_interval.max(1),
@@ -184,7 +195,9 @@ pub(crate) fn spawn(
                         network_discards: platform.network_discards,
                         top_processes,
                         blackbox_cpu_percent: own_process
-                            .map(|process| process.cpu_usage())
+                            .map(|process| {
+                                normalize_process_cpu(process.cpu_usage(), logical_processors)
+                            })
                             .unwrap_or(0.0),
                         blackbox_memory_bytes: own_process
                             .map(|process| process.memory())
@@ -760,6 +773,13 @@ mod tests {
         assert_eq!(budgeted_interval(2, 5.0), 5);
         assert_eq!(budgeted_interval(2, 10.0), 10);
         assert_eq!(budgeted_interval(10, 6.0), 10);
+    }
+
+    #[test]
+    fn process_cpu_is_normalized_to_total_machine_capacity() {
+        assert_eq!(normalize_process_cpu(400.0, 16), 25.0);
+        assert_eq!(normalize_process_cpu(200.0, 8), 25.0);
+        assert_eq!(normalize_process_cpu(150.0, 0), 100.0);
     }
 
     #[test]

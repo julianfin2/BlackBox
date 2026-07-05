@@ -25,7 +25,7 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use uuid::Uuid;
 
-const INCIDENT_SCHEMA_VERSION: u32 = 2;
+const INCIDENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Settings {
@@ -180,6 +180,7 @@ struct DiagnosticProcess {
     peak_offset_ms: i64,
     sample_count: usize,
     max_cpu_percent: f32,
+    max_cpu_core_percent: f32,
     max_memory_bytes: u64,
     max_disk_read_bytes_per_sec: u64,
     max_disk_write_bytes_per_sec: u64,
@@ -555,6 +556,12 @@ fn build_collection(
                         .map(|process| format!("{:.1}%", process.cpu_percent))
                         .unwrap_or_else(|| "未知".into()),
                 ),
+                collection_field(
+                    "核心等效占用",
+                    highest_cpu_process
+                        .map(|process| format!("{:.1}%", process.cpu_core_percent))
+                        .unwrap_or_else(|| "未知".into()),
+                ),
                 collection_field("进程数量", format!("Top {}", snapshot_processes.len())),
             ],
         },
@@ -792,6 +799,7 @@ fn build_diagnostics(
                     peak_offset_ms: offset_ms,
                     sample_count: 0,
                     max_cpu_percent: 0.0,
+                    max_cpu_core_percent: 0.0,
                     max_memory_bytes: 0,
                     max_disk_read_bytes_per_sec: 0,
                     max_disk_write_bytes_per_sec: 0,
@@ -801,6 +809,7 @@ fn build_diagnostics(
             entry.sample_count += 1;
             if process.cpu_percent > entry.max_cpu_percent {
                 entry.max_cpu_percent = process.cpu_percent;
+                entry.max_cpu_core_percent = process.cpu_core_percent;
                 entry.peak_offset_ms = offset_ms;
             }
             entry.max_memory_bytes = entry.max_memory_bytes.max(process.memory_bytes);
@@ -2089,7 +2098,8 @@ mod tests {
         samples[0].top_processes = vec![collector::ProcessSample {
             pid: 42,
             name: "load.exe".into(),
-            cpu_percent: 88.0,
+            cpu_percent: 22.0,
+            cpu_core_percent: 352.0,
             memory_bytes: 512 * 1024 * 1024,
             disk_write_bytes_per_sec: 4 * 1024 * 1024,
             ..Default::default()
@@ -2137,6 +2147,8 @@ mod tests {
         assert_eq!(diagnostics.points.len(), 2);
         assert_eq!(diagnostics.processes.len(), 1);
         assert_eq!(diagnostics.processes[0].name, "load.exe");
+        assert_eq!(diagnostics.processes[0].max_cpu_percent, 22.0);
+        assert_eq!(diagnostics.processes[0].max_cpu_core_percent, 352.0);
         assert_eq!(diagnostics.events.len(), 3);
         assert_eq!(diagnostics.events[0].provider, "Disk");
         assert!(diagnostics

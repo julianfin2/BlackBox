@@ -182,8 +182,8 @@ pub(crate) fn extract(
             push(
                 "单进程 CPU 峰值".into(),
                 format!(
-                    "{} 的 CPU 使用率达到 {:.1}%。",
-                    process.name, process.cpu_percent
+                    "{} 的整机 CPU 占比达到 {:.1}%，核心等效占用 {:.1}%。",
+                    process.name, process.cpu_percent, process.cpu_core_percent
                 ),
                 "Process",
                 sample,
@@ -601,6 +601,7 @@ mod tests {
             pid: 42,
             name: "load.exe".into(),
             cpu_percent: 88.0,
+            cpu_core_percent: 352.0,
             ..Default::default()
         }];
         let mut second = first.clone();
