@@ -25,6 +25,8 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use uuid::Uuid;
 
+const INCIDENT_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize, Clone)]
 struct Settings {
     sample_interval_seconds: u64,
@@ -109,18 +111,6 @@ struct Report {
     next_tests: Vec<Test>,
     generated_by: String,
 }
-#[derive(Serialize)]
-struct Point {
-    id: String,
-    title: String,
-    offset_ms: i64,
-    severity: String,
-}
-#[derive(Serialize)]
-struct Track {
-    label: String,
-    points: Vec<Point>,
-}
 #[derive(Serialize, Clone)]
 struct RawFile {
     name: String,
@@ -157,14 +147,73 @@ struct CollectionSummary {
     categories: Vec<CollectionCategory>,
 }
 #[derive(Serialize)]
+struct DiagnosticMetricPoint {
+    timestamp: String,
+    offset_ms: i64,
+    cpu_percent: f32,
+    memory_percent: f64,
+    available_memory_bytes: u64,
+    commit_percent: f64,
+    disk_read_bytes_per_sec: u64,
+    disk_write_bytes_per_sec: u64,
+    disk_latency_ms: f64,
+    disk_queue_length: f64,
+    network_bytes_per_sec: u64,
+    network_errors: u64,
+    network_discards: u64,
+    top_processes: Vec<collector::ProcessSample>,
+}
+#[derive(Serialize)]
+struct DiagnosticHighlight {
+    label: String,
+    value: String,
+    description: String,
+    offset_ms: i64,
+    severity: String,
+}
+#[derive(Serialize)]
+struct DiagnosticProcess {
+    pid: u32,
+    name: String,
+    first_offset_ms: i64,
+    last_offset_ms: i64,
+    peak_offset_ms: i64,
+    sample_count: usize,
+    max_cpu_percent: f32,
+    max_memory_bytes: u64,
+    max_disk_read_bytes_per_sec: u64,
+    max_disk_write_bytes_per_sec: u64,
+}
+#[derive(Serialize)]
+struct DiagnosticEvent {
+    id: String,
+    timestamp: Option<String>,
+    offset_ms: i64,
+    channel: String,
+    provider: String,
+    event_id: Option<u32>,
+    level: u8,
+    level_label: String,
+    summary: String,
+    details: String,
+    computer: String,
+}
+#[derive(Serialize)]
+struct DiagnosticWorkspace {
+    points: Vec<DiagnosticMetricPoint>,
+    highlights: Vec<DiagnosticHighlight>,
+    processes: Vec<DiagnosticProcess>,
+    events: Vec<DiagnosticEvent>,
+}
+#[derive(Serialize)]
 struct Detail {
     incident: Incident,
     pinned: bool,
     observations: Vec<Observation>,
-    timeline: Vec<Track>,
     report: Option<Report>,
     raw_files: Vec<RawFile>,
     collection: CollectionSummary,
+    diagnostics: DiagnosticWorkspace,
     data_path: String,
 }
 #[derive(Serialize)]
@@ -369,18 +418,11 @@ fn collection_status(incident: &Incident, available: bool) -> String {
 fn build_collection(
     dir: &Path,
     incident: &Incident,
+    metrics: &[collector::Sample],
     observations: &[Observation],
     report: &Option<Report>,
     raw_files: &[RawFile],
 ) -> CollectionSummary {
-    let metrics: Vec<collector::Sample> = fs::read_to_string(dir.join("evidence/metrics.jsonl"))
-        .map(|content| {
-            content
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect()
-        })
-        .unwrap_or_default();
     let trigger_ms = chrono::DateTime::parse_from_rfc3339(&incident.trigger_time)
         .map(|time| time.timestamp_millis())
         .unwrap_or_default();
@@ -406,6 +448,11 @@ fn build_collection(
     let event_count = system_events + application_events;
     let process: serde_json::Value =
         read_json(&dir.join("evidence/process_snapshot.json")).unwrap_or_default();
+    let snapshot_processes: Vec<collector::ProcessSample> =
+        serde_json::from_value(process["top_processes"].clone()).unwrap_or_default();
+    let highest_cpu_process = snapshot_processes
+        .iter()
+        .max_by(|left, right| left.cpu_percent.total_cmp(&right.cpu_percent));
     let capabilities: Option<capabilities::CapabilityReport> =
         read_json(&dir.join("evidence/capabilities.json")).ok();
     let user_report: Option<IncidentDraft> = read_json(&dir.join("user_report.json")).ok();
@@ -498,15 +545,17 @@ fn build_collection(
             details: vec![
                 collection_field(
                     "最高占用进程",
-                    process["top_process"].as_str().unwrap_or("未识别"),
+                    highest_cpu_process
+                        .map(|process| process.name.as_str())
+                        .unwrap_or("未识别"),
                 ),
                 collection_field(
                     "进程 CPU",
-                    process["cpu_percent"]
-                        .as_f64()
-                        .map(|value| format!("{value:.1}%"))
+                    highest_cpu_process
+                        .map(|process| format!("{:.1}%", process.cpu_percent))
                         .unwrap_or_else(|| "未知".into()),
                 ),
+                collection_field("进程数量", format!("Top {}", snapshot_processes.len())),
             ],
         },
         CollectionCategory {
@@ -674,6 +723,291 @@ fn build_collection(
         categories,
     }
 }
+fn load_incident_metrics(dir: &Path) -> Vec<collector::Sample> {
+    fs::read_to_string(dir.join("evidence/metrics.jsonl"))
+        .map(|content| {
+            content
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+fn compact_text(value: &str, limit: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= limit {
+        compact
+    } else {
+        format!("{}…", compact.chars().take(limit).collect::<String>())
+    }
+}
+fn event_level(level: Option<u8>) -> (u8, &'static str) {
+    match level.unwrap_or(4) {
+        1 => (1, "关键"),
+        2 => (2, "错误"),
+        3 => (3, "警告"),
+        5 => (5, "详细"),
+        _ => (4, "信息"),
+    }
+}
+fn build_diagnostics(
+    dir: &Path,
+    incident: &Incident,
+    metrics: &[collector::Sample],
+) -> DiagnosticWorkspace {
+    let trigger_ms = chrono::DateTime::parse_from_rfc3339(&incident.trigger_time)
+        .map(|time| time.timestamp_millis())
+        .unwrap_or_default();
+    let points = metrics
+        .iter()
+        .map(|sample| DiagnosticMetricPoint {
+            timestamp: sample.timestamp.clone(),
+            offset_ms: sample.timestamp_ms - trigger_ms,
+            cpu_percent: sample.cpu_percent,
+            memory_percent: sample.memory_percent,
+            available_memory_bytes: sample.available_memory_bytes,
+            commit_percent: sample.commit_percent,
+            disk_read_bytes_per_sec: sample.disk_read_bytes_per_sec,
+            disk_write_bytes_per_sec: sample.disk_write_bytes_per_sec,
+            disk_latency_ms: sample.disk_latency_ms,
+            disk_queue_length: sample.disk_queue_length,
+            network_bytes_per_sec: sample.network_bytes_per_sec,
+            network_errors: sample.network_errors,
+            network_discards: sample.network_discards,
+            top_processes: sample.top_processes.clone(),
+        })
+        .collect();
+
+    let mut process_map: HashMap<(u32, String), DiagnosticProcess> = HashMap::new();
+    for sample in metrics {
+        let offset_ms = sample.timestamp_ms - trigger_ms;
+        for process in &sample.top_processes {
+            let entry = process_map
+                .entry((process.pid, process.name.clone()))
+                .or_insert_with(|| DiagnosticProcess {
+                    pid: process.pid,
+                    name: process.name.clone(),
+                    first_offset_ms: offset_ms,
+                    last_offset_ms: offset_ms,
+                    peak_offset_ms: offset_ms,
+                    sample_count: 0,
+                    max_cpu_percent: 0.0,
+                    max_memory_bytes: 0,
+                    max_disk_read_bytes_per_sec: 0,
+                    max_disk_write_bytes_per_sec: 0,
+                });
+            entry.first_offset_ms = entry.first_offset_ms.min(offset_ms);
+            entry.last_offset_ms = entry.last_offset_ms.max(offset_ms);
+            entry.sample_count += 1;
+            if process.cpu_percent > entry.max_cpu_percent {
+                entry.max_cpu_percent = process.cpu_percent;
+                entry.peak_offset_ms = offset_ms;
+            }
+            entry.max_memory_bytes = entry.max_memory_bytes.max(process.memory_bytes);
+            entry.max_disk_read_bytes_per_sec = entry
+                .max_disk_read_bytes_per_sec
+                .max(process.disk_read_bytes_per_sec);
+            entry.max_disk_write_bytes_per_sec = entry
+                .max_disk_write_bytes_per_sec
+                .max(process.disk_write_bytes_per_sec);
+        }
+    }
+    let mut processes = process_map.into_values().collect::<Vec<_>>();
+    let process_score = |process: &DiagnosticProcess| {
+        process.max_cpu_percent as f64
+            + process.max_memory_bytes as f64 / 1_073_741_824.0 * 5.0
+            + (process.max_disk_read_bytes_per_sec + process.max_disk_write_bytes_per_sec) as f64
+                / 1_048_576.0
+    };
+    processes.sort_by(|left, right| {
+        process_score(right)
+            .partial_cmp(&process_score(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut event_records = analysis::parse_windows_events(
+        &fs::read_to_string(dir.join("evidence/system.xml")).unwrap_or_default(),
+        "System",
+    );
+    event_records.extend(analysis::parse_windows_events(
+        &fs::read_to_string(dir.join("evidence/application.xml")).unwrap_or_default(),
+        "Application",
+    ));
+    let mut events = event_records
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let offset_ms = event
+                .timestamp
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.timestamp_millis() - trigger_ms)
+                .unwrap_or_default();
+            let (level, level_label) = event_level(event.level);
+            let data = event.data.join("\n");
+            let details = if event.message.is_empty() {
+                data.clone()
+            } else if data.is_empty() {
+                event.message.clone()
+            } else {
+                format!("{}\n\n{}", event.message, data)
+            };
+            let summary_source = if !event.message.is_empty() {
+                &event.message
+            } else if !data.is_empty() {
+                &data
+            } else {
+                &event.provider
+            };
+            let summary = compact_text(summary_source, 180);
+            DiagnosticEvent {
+                id: format!("event_{:03}", index + 1),
+                timestamp: event.timestamp,
+                offset_ms,
+                channel: event.channel,
+                provider: event.provider,
+                event_id: event.event_id,
+                level,
+                level_label: level_label.into(),
+                summary,
+                details,
+                computer: event.computer,
+            }
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| event.offset_ms);
+
+    let mut highlights = Vec::new();
+    if let Some(sample) = metrics
+        .iter()
+        .max_by(|left, right| left.cpu_percent.total_cmp(&right.cpu_percent))
+    {
+        highlights.push(DiagnosticHighlight {
+            label: "CPU 峰值".into(),
+            value: format!("{:.1}%", sample.cpu_percent),
+            description: if sample.cpu_percent >= 90.0 {
+                "达到持续饱和排查阈值"
+            } else if sample.cpu_percent >= 75.0 {
+                "负载明显升高"
+            } else {
+                "未达到内置异常阈值"
+            }
+            .into(),
+            offset_ms: sample.timestamp_ms - trigger_ms,
+            severity: if sample.cpu_percent >= 90.0 {
+                "critical"
+            } else if sample.cpu_percent >= 75.0 {
+                "warning"
+            } else {
+                "info"
+            }
+            .into(),
+        });
+    }
+    if let Some(sample) = metrics.iter().max_by(|left, right| {
+        left.memory_percent
+            .total_cmp(&right.memory_percent)
+            .then_with(|| {
+                right
+                    .available_memory_bytes
+                    .cmp(&left.available_memory_bytes)
+            })
+    }) {
+        highlights.push(DiagnosticHighlight {
+            label: "内存峰值".into(),
+            value: format!("{:.1}%", sample.memory_percent),
+            description: format!(
+                "最低可用内存 {}",
+                format_bytes(sample.available_memory_bytes)
+            ),
+            offset_ms: sample.timestamp_ms - trigger_ms,
+            severity: if sample.memory_percent >= 90.0 {
+                "critical"
+            } else if sample.memory_percent >= 80.0 {
+                "warning"
+            } else {
+                "info"
+            }
+            .into(),
+        });
+    }
+    if let Some(sample) = metrics
+        .iter()
+        .max_by(|left, right| left.disk_latency_ms.total_cmp(&right.disk_latency_ms))
+    {
+        highlights.push(DiagnosticHighlight {
+            label: "磁盘延迟峰值".into(),
+            value: format!("{:.1} ms", sample.disk_latency_ms),
+            description: format!("同时队列长度 {:.1}", sample.disk_queue_length),
+            offset_ms: sample.timestamp_ms - trigger_ms,
+            severity: if sample.disk_latency_ms >= 100.0 {
+                "critical"
+            } else if sample.disk_latency_ms >= 30.0 {
+                "warning"
+            } else {
+                "info"
+            }
+            .into(),
+        });
+    }
+    if let Some(sample) = metrics
+        .iter()
+        .max_by_key(|sample| sample.network_bytes_per_sec)
+    {
+        let network_errors = metrics
+            .iter()
+            .map(|point| point.network_errors + point.network_discards)
+            .sum::<u64>();
+        highlights.push(DiagnosticHighlight {
+            label: "网络吞吐峰值".into(),
+            value: format!("{}/s", format_bytes(sample.network_bytes_per_sec)),
+            description: format!("窗口内错误与丢弃 {network_errors} 个"),
+            offset_ms: sample.timestamp_ms - trigger_ms,
+            severity: if network_errors > 0 {
+                "warning"
+            } else {
+                "info"
+            }
+            .into(),
+        });
+    }
+    let important_events = events.iter().filter(|event| event.level <= 2).count();
+    highlights.push(DiagnosticHighlight {
+        label: "关键 Windows 事件".into(),
+        value: format!("{important_events} 条"),
+        description: format!("共解析 {} 条筛选事件", events.len()),
+        offset_ms: events
+            .iter()
+            .filter(|event| event.level <= 2)
+            .min_by_key(|event| event.offset_ms.unsigned_abs())
+            .map(|event| event.offset_ms)
+            .unwrap_or_default(),
+        severity: if important_events > 0 {
+            "warning"
+        } else {
+            "info"
+        }
+        .into(),
+    });
+
+    DiagnosticWorkspace {
+        points,
+        highlights,
+        processes,
+        events,
+    }
+}
+fn format_bytes(value: u64) -> String {
+    if value < 1024 {
+        format!("{value} B")
+    } else if value < 1_048_576 {
+        format!("{:.1} KB", value as f64 / 1024.0)
+    } else if value < 1_073_741_824 {
+        format!("{:.1} MB", value as f64 / 1_048_576.0)
+    } else {
+        format!("{:.2} GB", value as f64 / 1_073_741_824.0)
+    }
+}
 fn load_incidents(s: &AppState) -> Vec<Incident> {
     let mut v: Vec<Incident> = fs::read_dir(incidents_dir(s))
         .map(|r| {
@@ -685,7 +1019,7 @@ fn load_incidents(s: &AppState) -> Vec<Incident> {
     v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     v
 }
-fn discard_legacy_incidents(root: &Path) -> Result<usize, String> {
+fn discard_unsupported_incidents(root: &Path) -> Result<usize, String> {
     let directory = root.join("incidents");
     let mut removed = 0;
     for entry in fs::read_dir(&directory)
@@ -703,8 +1037,16 @@ fn discard_legacy_incidents(root: &Path) -> Result<usize, String> {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             continue;
         };
-        if value.get("schema_version").is_none() {
+        if value["schema_version"].as_u64() != Some(INCIDENT_SCHEMA_VERSION as u64) {
+            let id = value["id"].as_str().map(str::to_owned).or_else(|| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            });
             fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+            if let Some(id) = id {
+                storage::delete_incident(root, &id)?;
+            }
             removed += 1;
         }
     }
@@ -712,32 +1054,10 @@ fn discard_legacy_incidents(root: &Path) -> Result<usize, String> {
 }
 fn build_detail(s: &AppState, i: Incident) -> Result<Detail, String> {
     let dir = incidents_dir(s).join(&i.id);
+    let metrics = load_incident_metrics(&dir);
     let observations: Vec<Observation> =
         read_json(&dir.join("extracted/facts.json")).unwrap_or_default();
     let report = read_json(&dir.join("report/report.json")).ok();
-    let labels = ["CPU", "内存", "磁盘", "网络", "事件"];
-    let timeline = labels
-        .iter()
-        .map(|label| Track {
-            label: (*label).into(),
-            points: observations
-                .iter()
-                .filter(|o| match *label {
-                    "CPU" => o.category == "CPU",
-                    "内存" => o.category == "Memory",
-                    "磁盘" => o.category == "Disk",
-                    "网络" => o.category == "Network",
-                    _ => o.category == "Events" || o.category == "Process",
-                })
-                .map(|o| Point {
-                    id: o.id.clone(),
-                    title: o.title.clone(),
-                    offset_ms: o.offset_ms,
-                    severity: o.severity.clone(),
-                })
-                .collect(),
-        })
-        .collect();
     let mut raw = vec![];
     for name in [
         "incident.json",
@@ -776,15 +1096,16 @@ fn build_detail(s: &AppState, i: Incident) -> Result<Detail, String> {
             })
         }
     }
-    let collection = build_collection(&dir, &i, &observations, &report, &raw);
+    let collection = build_collection(&dir, &i, &metrics, &observations, &report, &raw);
+    let diagnostics = build_diagnostics(&dir, &i, &metrics);
     Ok(Detail {
         incident: i,
         pinned: dir.join(".pinned").exists(),
         observations,
-        timeline,
         report,
         raw_files: raw,
         collection,
+        diagnostics,
         data_path: dir.to_string_lossy().into(),
     })
 }
@@ -961,7 +1282,7 @@ fn create_incident_internal(
     let now = Utc::now().to_rfc3339();
     let id = Uuid::new_v4().simple().to_string()[..8].to_string();
     let incident = Incident {
-        schema_version: 1,
+        schema_version: INCIDENT_SCHEMA_VERSION,
         id: id.clone(),
         created_at: now.clone(),
         trigger_time: trigger_override.unwrap_or(now),
@@ -1001,8 +1322,7 @@ fn create_incident_internal(
         &dir.join("evidence/process_snapshot.json"),
         &serde_json::json!({
             "timestamp": latest.timestamp,
-            "top_process": latest.top_process,
-            "cpu_percent": latest.top_process_cpu_percent,
+            "top_processes": latest.top_processes,
             "source": "sysinfo process snapshot"
         }),
     )?;
@@ -1520,13 +1840,14 @@ pub fn run() {
                     .map_err(std::io::Error::other)?;
             }
             storage::initialize(&root).map_err(std::io::Error::other)?;
-            let removed_legacy = discard_legacy_incidents(&root).map_err(std::io::Error::other)?;
-            if removed_legacy > 0 {
+            let removed_unsupported =
+                discard_unsupported_incidents(&root).map_err(std::io::Error::other)?;
+            if removed_unsupported > 0 {
                 storage::audit(
                     &root,
-                    "schema.legacy_incidents_discarded",
+                    "schema.unsupported_incidents_discarded",
                     None,
-                    Some(&removed_legacy.to_string()),
+                    Some(&removed_unsupported.to_string()),
                 )
                 .map_err(std::io::Error::other)?;
             }
@@ -1704,7 +2025,7 @@ mod tests {
 
     fn add_incident(root: &Path, id: &str, age_days: i64, pinned: bool) {
         let incident = Incident {
-            schema_version: 1,
+            schema_version: INCIDENT_SCHEMA_VERSION,
             id: id.into(),
             created_at: (Utc::now() - ChronoDuration::days(age_days)).to_rfc3339(),
             trigger_time: Utc::now().to_rfc3339(),
@@ -1750,7 +2071,7 @@ mod tests {
         let trigger_ms = chrono::DateTime::parse_from_rfc3339(&incident.trigger_time)
             .unwrap()
             .timestamp_millis();
-        let samples = [
+        let mut samples = [
             collector::Sample {
                 timestamp_ms: trigger_ms - 30_000,
                 timestamp: incident.trigger_time.clone(),
@@ -1764,6 +2085,15 @@ mod tests {
                 ..Default::default()
             },
         ];
+        samples[0].cpu_percent = 92.0;
+        samples[0].top_processes = vec![collector::ProcessSample {
+            pid: 42,
+            name: "load.exe".into(),
+            cpu_percent: 88.0,
+            memory_bytes: 512 * 1024 * 1024,
+            disk_write_bytes_per_sec: 4 * 1024 * 1024,
+            ..Default::default()
+        }];
         fs::write(
             directory.join("evidence/metrics.jsonl"),
             samples
@@ -1775,7 +2105,7 @@ mod tests {
         .unwrap();
         fs::write(
             directory.join("evidence/system.xml"),
-            "<Events><Event><System /></Event><Event><System /></Event></Events>",
+            "<Events><Event><System><Provider Name=\"Disk\"/><EventID>153</EventID><Level>2</Level><TimeCreated SystemTime=\"2026-01-01T00:00:00Z\"/></System><RenderingInfo><Message>存储请求重试。</Message></RenderingInfo></Event><Event><System /></Event></Events>",
         )
         .unwrap();
         fs::write(
@@ -1796,12 +2126,23 @@ mod tests {
         })
         .collect::<Vec<_>>();
 
-        let summary = build_collection(&directory, &incident, &[], &None, &raw_files);
+        let summary = build_collection(&directory, &incident, &samples, &[], &None, &raw_files);
 
         assert_eq!(summary.sample_count, 2);
         assert_eq!(summary.event_count, 3);
         assert_eq!(summary.actual_coverage, "−30 秒 至 +10 秒");
         assert_eq!(summary.sensitivity_level, 2);
+
+        let diagnostics = build_diagnostics(&directory, &incident, &samples);
+        assert_eq!(diagnostics.points.len(), 2);
+        assert_eq!(diagnostics.processes.len(), 1);
+        assert_eq!(diagnostics.processes[0].name, "load.exe");
+        assert_eq!(diagnostics.events.len(), 3);
+        assert_eq!(diagnostics.events[0].provider, "Disk");
+        assert!(diagnostics
+            .highlights
+            .iter()
+            .any(|highlight| highlight.label == "CPU 峰值"));
     }
 
     #[test]
@@ -1901,25 +2242,36 @@ mod tests {
         add_incident(&root.0, "manifest", 0, false);
         let value: serde_json::Value =
             read_json(&root.0.join("incidents/manifest/incident.json")).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], INCIDENT_SCHEMA_VERSION);
         assert_eq!(value["trigger_source"], "test");
         assert_eq!(value["machine_id"], "test-machine");
         assert_eq!(value["app_version"], "0.1.0");
     }
 
     #[test]
-    fn legacy_incident_directories_are_discarded_without_migration() {
+    fn unsupported_incident_directories_are_discarded_without_migration() {
         let root = TestDirectory::new();
         let legacy = root.0.join("incidents/legacy");
+        let old_version = root.0.join("incidents/old-version");
         write_json(
             &legacy.join("incident.json"),
             &serde_json::json!({ "id": "legacy", "trigger_time": "2026-01-01T00:00:00Z" }),
         )
         .unwrap();
+        write_json(
+            &old_version.join("incident.json"),
+            &serde_json::json!({
+                "schema_version": 1,
+                "id": "old-version",
+                "trigger_time": "2026-01-01T00:00:00Z"
+            }),
+        )
+        .unwrap();
         add_incident(&root.0, "current", 0, false);
 
-        assert_eq!(discard_legacy_incidents(&root.0).unwrap(), 1);
+        assert_eq!(discard_unsupported_incidents(&root.0).unwrap(), 2);
         assert!(!legacy.exists());
+        assert!(!old_version.exists());
         assert!(root.0.join("incidents/current").exists());
     }
 }

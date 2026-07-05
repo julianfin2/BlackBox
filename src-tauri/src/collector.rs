@@ -17,6 +17,17 @@ use sysinfo::{Networks, ProcessesToUpdate, System};
 use crate::{read_json, Settings};
 
 const SEGMENT_BYTES: u64 = 32 * 1024 * 1024;
+const TOP_PROCESS_LIMIT: usize = 8;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub(crate) struct ProcessSample {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_percent: f32,
+    pub memory_bytes: u64,
+    pub disk_read_bytes_per_sec: u64,
+    pub disk_write_bytes_per_sec: u64,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub(crate) struct Sample {
@@ -33,12 +44,61 @@ pub(crate) struct Sample {
     pub network_bytes_per_sec: u64,
     pub network_errors: u64,
     pub network_discards: u64,
-    pub top_process: Option<String>,
-    pub top_process_cpu_percent: f32,
+    pub top_processes: Vec<ProcessSample>,
     pub blackbox_cpu_percent: f32,
     pub blackbox_memory_bytes: u64,
     pub blackbox_disk_write_bytes_per_sec: u64,
     pub effective_interval_seconds: u64,
+}
+
+fn select_top_processes(mut processes: Vec<ProcessSample>, limit: usize) -> Vec<ProcessSample> {
+    let max_cpu = processes
+        .iter()
+        .map(|process| process.cpu_percent)
+        .fold(0.0_f32, f32::max);
+    let max_memory = processes
+        .iter()
+        .map(|process| process.memory_bytes)
+        .max()
+        .unwrap_or(0);
+    let max_io = processes
+        .iter()
+        .map(|process| {
+            process
+                .disk_read_bytes_per_sec
+                .saturating_add(process.disk_write_bytes_per_sec)
+        })
+        .max()
+        .unwrap_or(0);
+    let score = |process: &ProcessSample| {
+        let cpu = if max_cpu > 0.0 {
+            process.cpu_percent as f64 / max_cpu as f64
+        } else {
+            0.0
+        };
+        let memory = if max_memory > 0 {
+            process.memory_bytes as f64 / max_memory as f64
+        } else {
+            0.0
+        };
+        let io = if max_io > 0 {
+            process
+                .disk_read_bytes_per_sec
+                .saturating_add(process.disk_write_bytes_per_sec) as f64
+                / max_io as f64
+        } else {
+            0.0
+        };
+        cpu.max(memory).max(io)
+    };
+    processes.sort_by(|left, right| {
+        score(right)
+            .partial_cmp(&score(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.cpu_percent.total_cmp(&left.cpu_percent))
+    });
+    processes.truncate(limit);
+    processes
 }
 
 pub(crate) fn spawn(
@@ -77,11 +137,26 @@ pub(crate) fn spawn(
                         .values()
                         .map(|data| data.received() + data.transmitted())
                         .sum();
-                    let top = system.processes().values().max_by(|a, b| {
-                        a.cpu_usage()
-                            .partial_cmp(&b.cpu_usage())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    let top_processes = select_top_processes(
+                        system
+                            .processes()
+                            .values()
+                            .map(|process| {
+                                let disk = process.disk_usage();
+                                ProcessSample {
+                                    pid: process.pid().as_u32(),
+                                    name: process.name().to_string_lossy().into_owned(),
+                                    cpu_percent: process.cpu_usage(),
+                                    memory_bytes: process.memory(),
+                                    disk_read_bytes_per_sec: disk.read_bytes
+                                        / effective_interval.max(1),
+                                    disk_write_bytes_per_sec: disk.written_bytes
+                                        / effective_interval.max(1),
+                                }
+                            })
+                            .collect(),
+                        TOP_PROCESS_LIMIT,
+                    );
                     let own_process = sysinfo::get_current_pid()
                         .ok()
                         .and_then(|pid| system.process(pid));
@@ -107,8 +182,7 @@ pub(crate) fn spawn(
                         network_bytes_per_sec: network / effective_interval.max(1),
                         network_errors: platform.network_errors,
                         network_discards: platform.network_discards,
-                        top_process: top.map(|p| p.name().to_string_lossy().into_owned()),
-                        top_process_cpu_percent: top.map(|p| p.cpu_usage()).unwrap_or(0.0),
+                        top_processes,
                         blackbox_cpu_percent: own_process
                             .map(|process| process.cpu_usage())
                             .unwrap_or(0.0),
@@ -476,7 +550,14 @@ pub(crate) fn export_event_logs(
         let xml = destination.join(format!("{}.xml", channel.to_lowercase()));
         let query_arg = format!("/q:{query}");
         match Command::new("wevtutil")
-            .args(["qe", channel, &query_arg, "/rd:true", "/f:xml", "/c:200"])
+            .args([
+                "qe",
+                channel,
+                &query_arg,
+                "/rd:true",
+                "/f:RenderedXml",
+                "/c:200",
+            ])
             .output()
         {
             Ok(result) if result.status.success() => {
@@ -679,5 +760,47 @@ mod tests {
         assert_eq!(budgeted_interval(2, 5.0), 5);
         assert_eq!(budgeted_interval(2, 10.0), 10);
         assert_eq!(budgeted_interval(10, 6.0), 10);
+    }
+
+    #[test]
+    fn top_process_selection_keeps_cpu_memory_and_io_leaders() {
+        let processes = vec![
+            ProcessSample {
+                pid: 1,
+                name: "cpu.exe".into(),
+                cpu_percent: 90.0,
+                ..Default::default()
+            },
+            ProcessSample {
+                pid: 2,
+                name: "memory.exe".into(),
+                memory_bytes: 8 * 1024 * 1024 * 1024,
+                ..Default::default()
+            },
+            ProcessSample {
+                pid: 3,
+                name: "io.exe".into(),
+                disk_write_bytes_per_sec: 500 * 1024 * 1024,
+                ..Default::default()
+            },
+            ProcessSample {
+                pid: 4,
+                name: "idle.exe".into(),
+                cpu_percent: 0.1,
+                memory_bytes: 1024,
+                ..Default::default()
+            },
+        ];
+
+        let selected = select_top_processes(processes, 3);
+        let names = selected
+            .iter()
+            .map(|process| process.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"cpu.exe"));
+        assert!(names.contains(&"memory.exe"));
+        assert!(names.contains(&"io.exe"));
+        assert!(!names.contains(&"idle.exe"));
     }
 }

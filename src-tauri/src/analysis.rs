@@ -1,5 +1,6 @@
 use crate::{collector::Sample, Cause, Observation, Report, Test};
-use quick_xml::{events::Event, Reader};
+use quick_xml::{escape::unescape, events::Event, Reader};
+use serde::Serialize;
 
 struct ObservationDraft {
     id: String,
@@ -167,23 +168,27 @@ pub(crate) fn extract(
             );
         }
     }
-    if let Some(sample) = samples.iter().max_by(|a, b| {
-        a.top_process_cpu_percent
-            .partial_cmp(&b.top_process_cpu_percent)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }) {
-        if sample.top_process_cpu_percent >= 80.0 {
+    if let Some((sample, process)) = samples
+        .iter()
+        .flat_map(|sample| {
+            sample
+                .top_processes
+                .iter()
+                .map(move |process| (sample, process))
+        })
+        .max_by(|(_, left), (_, right)| left.cpu_percent.total_cmp(&right.cpu_percent))
+    {
+        if process.cpu_percent >= 80.0 {
             push(
                 "单进程 CPU 峰值".into(),
                 format!(
                     "{} 的 CPU 使用率达到 {:.1}%。",
-                    sample.top_process.as_deref().unwrap_or("未知进程"),
-                    sample.top_process_cpu_percent
+                    process.name, process.cpu_percent
                 ),
                 "Process",
                 sample,
                 "warning",
-                Some(sample.top_process_cpu_percent as f64),
+                Some(process.cpu_percent as f64),
                 Some("%"),
             );
         }
@@ -205,7 +210,10 @@ pub(crate) fn extract(
             Some("packets"),
         );
     }
-    for fact in parse_windows_events(&format!("{system_events}\n{application_events}")) {
+    for fact in parse_windows_events(system_events, "System")
+        .into_iter()
+        .chain(parse_windows_events(application_events, "Application"))
+    {
         let Some((title, description, severity)) = classify_windows_event(&fact) else {
             continue;
         };
@@ -254,28 +262,53 @@ pub(crate) fn extract(
     observations
 }
 
-#[derive(Default)]
-struct WindowsEventFact {
-    provider: String,
-    event_id: Option<u32>,
-    timestamp: Option<String>,
+#[derive(Default, Serialize, Clone)]
+pub(crate) struct WindowsEventRecord {
+    pub provider: String,
+    pub event_id: Option<u32>,
+    pub timestamp: Option<String>,
+    pub level: Option<u8>,
+    pub channel: String,
+    pub computer: String,
+    pub message: String,
+    pub data: Vec<String>,
 }
 
-fn parse_windows_events(xml: &str) -> Vec<WindowsEventFact> {
+pub(crate) fn parse_windows_events(xml: &str, fallback_channel: &str) -> Vec<WindowsEventRecord> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-    let mut facts = Vec::new();
-    let mut current = WindowsEventFact::default();
+    let mut records = Vec::new();
+    let mut current = WindowsEventRecord::default();
     let mut inside_event = false;
-    let mut inside_event_id = false;
+    let mut text_field: Option<String> = None;
+    let mut data_name: Option<String> = None;
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => match element.local_name().as_ref() {
                 b"Event" => {
-                    current = WindowsEventFact::default();
+                    current = WindowsEventRecord {
+                        channel: fallback_channel.into(),
+                        ..Default::default()
+                    };
                     inside_event = true;
                 }
-                b"EventID" if inside_event => inside_event_id = true,
+                b"EventID" | b"Level" | b"Channel" | b"Computer" | b"Message" if inside_event => {
+                    text_field =
+                        Some(String::from_utf8_lossy(element.local_name().as_ref()).into_owned());
+                }
+                b"Data" if inside_event => {
+                    text_field = Some("Data".into());
+                    data_name = element
+                        .attributes()
+                        .flatten()
+                        .find(|attribute| attribute.key.local_name().as_ref() == b"Name")
+                        .and_then(|attribute| {
+                            attribute
+                                .decode_and_unescape_value(reader.decoder())
+                                .ok()
+                                .map(|value| value.into_owned())
+                        });
+                }
                 b"Provider" if inside_event => {
                     for attribute in element.attributes().flatten() {
                         if attribute.key.local_name().as_ref() == b"Name" {
@@ -321,15 +354,64 @@ fn parse_windows_events(xml: &str) -> Vec<WindowsEventFact> {
                 }
                 _ => {}
             },
-            Ok(Event::Text(text)) if inside_event_id => {
-                current.event_id = text.decode().ok().and_then(|value| value.parse().ok());
+            Ok(Event::Text(text)) if inside_event => {
+                let decoded = text
+                    .decode()
+                    .map(|value| value.into_owned())
+                    .unwrap_or_default();
+                let value = unescape(&decoded)
+                    .map(|value| value.into_owned())
+                    .unwrap_or(decoded);
+                match text_field.as_deref() {
+                    Some("EventID") => current.event_id = value.parse().ok(),
+                    Some("Level") => current.level = value.parse().ok(),
+                    Some("Channel") => current.channel = value,
+                    Some("Computer") => current.computer = value,
+                    Some("Message") => {
+                        if !current.message.is_empty() {
+                            current.message.push(' ');
+                        }
+                        current.message.push_str(&value);
+                    }
+                    Some("Data") if !value.is_empty() => current.data.push(match &data_name {
+                        Some(name) if !name.is_empty() => format!("{name}: {value}"),
+                        _ => value,
+                    }),
+                    _ => {}
+                }
+            }
+            Ok(Event::GeneralRef(reference)) if inside_event => {
+                let name = reference
+                    .decode()
+                    .map(|value| value.into_owned())
+                    .unwrap_or_default();
+                let encoded = format!("&{name};");
+                let value = unescape(&encoded)
+                    .map(|value| value.into_owned())
+                    .unwrap_or(encoded);
+                match text_field.as_deref() {
+                    Some("Message") => {
+                        if !current.message.is_empty() {
+                            current.message.push(' ');
+                        }
+                        current.message.push_str(&value);
+                    }
+                    Some("Data") if !value.is_empty() => current.data.push(match &data_name {
+                        Some(name) if !name.is_empty() => format!("{name}: {value}"),
+                        _ => value,
+                    }),
+                    _ => {}
+                }
             }
             Ok(Event::End(element)) => match element.local_name().as_ref() {
-                b"EventID" => inside_event_id = false,
+                b"EventID" | b"Level" | b"Channel" | b"Computer" | b"Message" | b"Data" => {
+                    text_field = None;
+                    data_name = None;
+                }
                 b"Event" => {
                     if inside_event {
-                        facts.push(current);
-                        current = WindowsEventFact::default();
+                        records.push(current);
+                        current = WindowsEventRecord::default();
                         inside_event = false;
                     }
                 }
@@ -339,10 +421,12 @@ fn parse_windows_events(xml: &str) -> Vec<WindowsEventFact> {
             _ => {}
         }
     }
-    facts
+    records
 }
 
-fn classify_windows_event(fact: &WindowsEventFact) -> Option<(&'static str, String, &'static str)> {
+fn classify_windows_event(
+    fact: &WindowsEventRecord,
+) -> Option<(&'static str, String, &'static str)> {
     let provider = fact.provider.to_ascii_lowercase();
     let event_id = fact.event_id;
     let (title, description, severity) =
@@ -513,8 +597,12 @@ mod tests {
         first.disk_latency_ms = 820.0;
         first.disk_queue_length = 8.0;
         first.network_errors = 2;
-        first.top_process = Some("load.exe".into());
-        first.top_process_cpu_percent = 88.0;
+        first.top_processes = vec![crate::collector::ProcessSample {
+            pid: 42,
+            name: "load.exe".into(),
+            cpu_percent: 88.0,
+            ..Default::default()
+        }];
         let mut second = first.clone();
         second.timestamp_ms = 3_000;
 
@@ -549,5 +637,20 @@ mod tests {
         assert_eq!(observations[0].severity, "critical");
         assert!(observations[0].title.contains("WHEA"));
         assert_eq!(observations[0].offset_ms, -2_000);
+    }
+
+    #[test]
+    fn parses_rendered_windows_event_details() {
+        let records = parse_windows_events(
+            "<Events><Event><System><Provider Name=\"Application Error\"/><EventID>1000</EventID><Level>2</Level><TimeCreated SystemTime=\"2026-07-03T15:20:12Z\"/><Channel>Application</Channel><Computer>WORKSTATION</Computer></System><EventData><Data Name=\"AppName\">demo.exe</Data></EventData><RenderingInfo><Message>程序 &amp; 服务已停止工作。</Message></RenderingInfo></Event></Events>",
+            "Application",
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].provider, "Application Error");
+        assert_eq!(records[0].event_id, Some(1000));
+        assert_eq!(records[0].level, Some(2));
+        assert_eq!(records[0].message, "程序 & 服务已停止工作。");
+        assert_eq!(records[0].data, vec!["AppName: demo.exe"]);
     }
 }
