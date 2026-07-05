@@ -39,3 +39,4 @@
 .diagnostic-table-head{padding-right:23px}
 .incident{display:flex;padding:0 20px}.incident>span{line-height:20px;text-align:center}
 .incident-status{display:flex;flex-direction:column;align-items:flex-start;gap:4px}.incident-status em{font-style:normal}.incident-status small{display:flex;align-items:center;gap:4px;color:#e48660!important;font-size:10px!important;font-variant-numeric:tabular-nums}.incident-status small svg{width:12px;height:12px}.processing b em{margin-left:7px;color:#ef8a66;font-style:normal;font-variant-numeric:tabular-nums}.recent button small{font-variant-numeric:tabular-nums}
+.recent>button:not(.link){grid-template-columns:14px 1fr 1fr 16px}
