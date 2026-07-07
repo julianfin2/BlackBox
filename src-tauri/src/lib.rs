@@ -1955,13 +1955,28 @@ fn set_incident_pinned(s: State<AppState>, id: String, pinned: bool) -> Result<D
 }
 
 #[tauri::command]
-fn export_incident_package(
-    s: State<AppState>,
+async fn export_incident_package(
+    s: State<'_, AppState>,
     id: String,
     destination_path: String,
 ) -> Result<String, String> {
-    let _guard = s.io_lock.lock().unwrap_or_else(|error| error.into_inner());
-    let source = incidents_dir(&s).join(&id);
+    let root = s.root.clone();
+    let io_lock = s.io_lock.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        export_incident_package_blocking(root, io_lock, id, destination_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn export_incident_package_blocking(
+    root: PathBuf,
+    io_lock: Arc<Mutex<()>>,
+    id: String,
+    destination_path: String,
+) -> Result<String, String> {
+    let _guard = io_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let source = root.join("incidents").join(&id);
     if !source.is_dir() {
         return Err("事故不存在".into());
     }
@@ -2000,7 +2015,7 @@ fn export_incident_package(
     writer.finish().map_err(|error| error.to_string())?;
 
     storage::audit(
-        &s.root,
+        &root,
         "incident.exported",
         Some(&incident.id),
         Some(&destination.to_string_lossy()),
