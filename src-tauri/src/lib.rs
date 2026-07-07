@@ -3,6 +3,7 @@ mod analysis;
 mod auto_trigger;
 mod capabilities;
 mod collector;
+mod recovery;
 mod service;
 mod storage;
 mod wpr;
@@ -285,6 +286,7 @@ struct RecoveryCandidate {
     detected_at: String,
     previous_session_started_at: String,
     last_sample_at: Option<String>,
+    evidence_summary: String,
 }
 struct AppState {
     root: PathBuf,
@@ -1966,7 +1968,10 @@ fn resolve_recovery(s: State<AppState>, create: bool) -> Result<Option<Detail>, 
             severity: "high".into(),
             duration_seconds: 0,
             still_happening: false,
-            description: "检测到上次系统黑盒子会话未正常结束".into(),
+            description: format!(
+                "Windows 事件日志提示上次系统可能异常重启：{}",
+                candidate.evidence_summary
+            ),
         },
         trigger_time,
         "recovery",
@@ -2212,20 +2217,13 @@ pub fn run() {
             let io_lock = Arc::new(Mutex::new(()));
             let incident_cancellations = Arc::new(Mutex::new(HashMap::new()));
             let service_backed = service::ping(&root);
-            let previous_session: Option<serde_json::Value> =
-                read_json(&root.join("session.lock")).ok();
-            let recovery = previous_session.map(|value| RecoveryCandidate {
-                detected_at: Utc::now().to_rfc3339(),
-                previous_session_started_at: value
-                    .get("started_at")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("未知")
-                    .into(),
-                last_sample_at: value
-                    .get("last_sample_at")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned),
-            });
+            let recovery =
+                recovery::detect_unexpected_restart().map(|detected| RecoveryCandidate {
+                    detected_at: Utc::now().to_rfc3339(),
+                    previous_session_started_at: "Windows 事件日志".into(),
+                    last_sample_at: detected.event_time,
+                    evidence_summary: detected.evidence_summary,
+                });
             let (logman_status, wpr_status) = if service_backed {
                 service::runtime(&root)
                     .map(|runtime| {

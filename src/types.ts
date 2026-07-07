@@ -15,7 +15,7 @@ export interface DiagnosticEvent { id: string; timestamp: string | null; offset_
 export interface DiagnosticWorkspace { points: DiagnosticMetricPoint[]; highlights: DiagnosticHighlight[]; processes: DiagnosticProcess[]; events: DiagnosticEvent[] }
 export interface IncidentDetail { incident: Incident; pinned: boolean; observations: Observation[]; report: Report | null; raw_files: { name: string; kind: string; size_bytes: number }[]; collection: CollectionSummary; diagnostics: DiagnosticWorkspace; data_path: string }
 export interface AppSettings { sample_interval_seconds: number; retention_days: number; rolling_limit_gb: number; incident_limit_gb: number; ai_mode: "disabled" | "ollama"; ollama_endpoint: string; ollama_model: string; dumps_enabled: boolean; auto_trigger_enabled: boolean; auto_trigger_cooldown_minutes: number; auto_trigger_max_per_hour: number }
-export interface RecoveryCandidate { detected_at: string; previous_session_started_at: string; last_sample_at: string | null }
+export interface RecoveryCandidate { detected_at: string; previous_session_started_at: string; last_sample_at: string | null; evidence_summary: string }
 export type CapabilityStatus = "available" | "degraded" | "unavailable" | "permission_required" | "not_installed" | "misconfigured" | "disabled";
 export interface DiagnosticCapability { id: string; name: string; category: string; status: CapabilityStatus; required_now: boolean; usage: string; detail: string; path: string | null; version: string | null; requires_admin: boolean; recommendation: string | null }
 export interface CapabilityReport { checked_at: string; is_elevated: boolean; available: number; attention: number; capabilities: DiagnosticCapability[] }
