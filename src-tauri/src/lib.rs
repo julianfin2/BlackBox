@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
+    fs::File,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -28,6 +30,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use uuid::Uuid;
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 const INCIDENT_SCHEMA_VERSION: u32 = 4;
 
@@ -350,6 +353,74 @@ fn settings_path(s: &AppState) -> PathBuf {
 }
 fn incidents_dir(s: &AppState) -> PathBuf {
     s.root.join("incidents")
+}
+fn normalize_user_path(value: &str) -> PathBuf {
+    let trimmed = value.trim().trim_matches('"');
+    PathBuf::from(trimmed)
+}
+fn zip_path_name(root: &Path, path: &Path) -> Result<String, String> {
+    let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+    let parts = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Err("无法生成事故包路径".into());
+    }
+    Ok(parts.join("/"))
+}
+fn write_zip_dir(
+    writer: &mut ZipWriter<File>,
+    root: &Path,
+    directory: &Path,
+    options: SimpleFileOptions,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path == root.join("package.json") {
+            continue;
+        }
+        let name = zip_path_name(root, &path)?;
+        if path.is_dir() {
+            writer
+                .add_directory(format!("{name}/"), options)
+                .map_err(|error| error.to_string())?;
+            write_zip_dir(writer, root, &path, options)?;
+        } else {
+            writer
+                .start_file(name, options)
+                .map_err(|error| error.to_string())?;
+            let mut file = File::open(&path).map_err(|error| error.to_string())?;
+            io::copy(&mut file, writer).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+fn unzip_to_directory(package: &Path, destination: &Path) -> Result<(), String> {
+    let file = File::open(package).map_err(|error| error.to_string())?;
+    let mut archive = ZipArchive::new(file).map_err(|error| error.to_string())?;
+    fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
+        let Some(enclosed_name) = entry.enclosed_name() else {
+            return Err("事故包包含不安全路径".into());
+        };
+        let target = destination.join(enclosed_name);
+        if entry.is_dir() {
+            fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let mut output = File::create(&target).map_err(|error| error.to_string())?;
+            io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 fn load_or_create_machine_id(root: &Path) -> Result<String, String> {
     let path = root.join("machine-id");
@@ -1882,6 +1953,124 @@ fn set_incident_pinned(s: State<AppState>, id: String, pinned: bool) -> Result<D
     let incident = read_json(&dir.join("incident.json"))?;
     build_detail(&s, incident)
 }
+
+#[tauri::command]
+fn export_incident_package(
+    s: State<AppState>,
+    id: String,
+    destination_path: String,
+) -> Result<String, String> {
+    let _guard = s.io_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let source = incidents_dir(&s).join(&id);
+    if !source.is_dir() {
+        return Err("事故不存在".into());
+    }
+    let incident: Incident = read_json(&source.join("incident.json"))?;
+    let mut destination = normalize_user_path(&destination_path);
+    if destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_none_or(|value| !value.eq_ignore_ascii_case("bbi"))
+    {
+        destination.set_extension("bbi");
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    let file = File::create(&destination).map_err(|error| error.to_string())?;
+    let mut writer = ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    write_zip_dir(&mut writer, &source, &source, options)?;
+    writer
+        .start_file("package.json", options)
+        .map_err(|error| error.to_string())?;
+    writer
+        .write_all(
+            &serde_json::to_vec_pretty(&serde_json::json!({
+                "format": "系统黑盒子事故包",
+                "version": 1,
+                "exported_at": Utc::now().to_rfc3339(),
+                "incident_id": incident.id,
+                "schema_version": incident.schema_version
+            }))
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    writer.finish().map_err(|error| error.to_string())?;
+
+    storage::audit(
+        &s.root,
+        "incident.exported",
+        Some(&incident.id),
+        Some(&destination.to_string_lossy()),
+    )?;
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn import_incident_package(s: State<AppState>, package_path: String) -> Result<Detail, String> {
+    let source = normalize_user_path(&package_path);
+    if !source.is_file() {
+        return Err("请选择 .bbi 事故包文件".into());
+    }
+    if source
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_none_or(|value| !value.eq_ignore_ascii_case("bbi"))
+    {
+        return Err("事故包格式不正确，请选择 .bbi 文件".into());
+    }
+    let temp_dir = s
+        .root
+        .join("imports")
+        .join(format!("import-{}", Uuid::new_v4().simple()));
+    if let Err(error) = unzip_to_directory(&source, &temp_dir) {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(error);
+    }
+    let incident: Incident = match read_json(&temp_dir.join("incident.json")) {
+        Ok(incident) => incident,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Err(format!("事故包无效：{error}"));
+        }
+    };
+    if incident.schema_version != INCIDENT_SCHEMA_VERSION {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(format!(
+            "事故包版本不兼容：当前支持 v{}，该事故包为 v{}",
+            INCIDENT_SCHEMA_VERSION, incident.schema_version
+        ));
+    }
+    let _ = fs::remove_file(temp_dir.join("package.json"));
+    let _guard = s.io_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let destination = incidents_dir(&s).join(&incident.id);
+    if destination.exists() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err("本机已经存在相同 ID 的事故记录".into());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    if let Err(error) = fs::rename(&temp_dir, &destination) {
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_dir_all(&destination);
+        return Err(error.to_string());
+    }
+    if let Err(error) = storage::upsert_incident(&s.root, &incident) {
+        let _ = fs::remove_dir_all(&destination);
+        return Err(error);
+    }
+    storage::audit(
+        &s.root,
+        "incident.imported",
+        Some(&incident.id),
+        Some(&source.to_string_lossy()),
+    )?;
+    build_detail(&s, incident)
+}
+
 #[tauri::command]
 fn delete_all_incidents(s: State<AppState>) -> Result<(), String> {
     cancel_all_incidents(&s.incident_cancellations);
@@ -2189,6 +2378,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             let root = app.path().app_data_dir()?;
@@ -2373,6 +2563,8 @@ pub fn run() {
             analyze_incident,
             delete_incident,
             set_incident_pinned,
+            export_incident_package,
+            import_incident_package,
             delete_all_incidents,
             delete_all_data,
             get_recovery_candidate,
