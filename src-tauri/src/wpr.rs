@@ -52,8 +52,22 @@ fn indicates_running(detail: &str) -> bool {
     let lower = detail.to_ascii_lowercase();
     (lower.contains("is recording")
         || lower.contains("recording profile")
+        || lower.contains("profile id:")
         || detail.contains("正在记录"))
         && !lower.contains("not recording")
+}
+
+fn indicates_already_running(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("already running") || lower.contains("0xc5583001")
+}
+
+fn running_or_conflict_status(root: &Path) -> String {
+    if ownership_path(root).is_file() {
+        "运行中（WPR 内存环形会话）".into()
+    } else {
+        "降级：检测到其他程序正在使用 WPR，未抢占现有会话".into()
+    }
 }
 
 pub(crate) fn status(root: &Path) -> WprStatus {
@@ -107,11 +121,7 @@ pub(crate) fn start(root: &Path) -> String {
     };
     let current = status(root);
     if current.running {
-        return if ownership_path(root).is_file() {
-            "运行中（WPR 内存环形会话）".into()
-        } else {
-            "降级：检测到其他程序正在使用 WPR，未抢占现有会话".into()
-        };
+        return running_or_conflict_status(root);
     }
     let _ = fs::remove_file(ownership_path(root));
     let profile_argument = format!("{}!SystemBlackBox", profile.to_string_lossy());
@@ -126,7 +136,14 @@ pub(crate) fn start(root: &Path) -> String {
             );
             "运行中（WPR 内存环形会话）".into()
         }
-        Ok(output) => format!("降级：WPR 启动失败（{}）", output_detail(&output)),
+        Ok(output) => {
+            let detail = output_detail(&output);
+            if indicates_already_running(&detail) {
+                running_or_conflict_status(root)
+            } else {
+                format!("降级：WPR 启动失败（{detail}）")
+            }
+        }
         Err(error) => format!("降级：WPR 不可用（{error}）"),
     }
 }
@@ -222,5 +239,11 @@ mod tests {
             "WPR is recording using the following set of profile(s): SystemBlackBox"
         ));
         assert!(indicates_running("WPR 正在记录以下配置文件"));
+        assert!(indicates_running(
+            "The profiles are already running.\nProfile Id: SystemBlackBox"
+        ));
+        assert!(indicates_already_running(
+            "The profiles are already running. Error code: 0xc5583001"
+        ));
     }
 }
